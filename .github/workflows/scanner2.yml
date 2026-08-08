@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
 
   schedule:
-    - cron: "30 21 * * 1-5"
+    - cron: "00 21 * * 1-5"
 
+  workflow_dispatch:
 jobs:
 
   scanner2:
