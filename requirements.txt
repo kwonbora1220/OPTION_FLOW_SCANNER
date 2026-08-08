@@ -1,3 +1,3 @@
-requirements.txtpandas
+pandas
 numpy
 yfinance
