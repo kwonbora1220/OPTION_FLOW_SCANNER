@@ -1,9 +1,10 @@
-name: Scanner 2
+name: OPTION FLOW SCANNER 2
 
 on:
   schedule:
     # 한국시간 화~토 오전 6시
-    # UTC 월~금 21:00
+    # GitHub Actions는 UTC 기준
+    # 월~금 21:00 UTC = 한국시간 화~토 06:00
     - cron: "00 21 * * 1-5"
 
   # GitHub Actions에서 수동 실행 가능
@@ -15,36 +16,93 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # ============================================================
+      # 1. 저장소 가져오기
+      # ============================================================
       - name: 체크아웃 저장소
         uses: actions/checkout@v4
 
-      - name: 파이썬 설정
+      # ============================================================
+      # 2. Python 설정
+      # ============================================================
+      - name: Python 설정
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # ============================================================
+      # 3. 종속성 설치
+      # ============================================================
       - name: 종속성 설치
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ============================================================
+      # 4. 파일 구조 확인
+      # ============================================================
+      - name: 파일 구조 확인
+        run: |
+          echo "========================================"
+          echo "OPTION FLOW SCANNER 2"
+          echo "========================================"
+          echo "현재 위치:"
+          pwd
+          echo ""
+          echo "저장소 파일:"
+          find . -maxdepth 2 -type f | sort
+          echo "========================================"
+
+      # ============================================================
+      # 5. 자동 유니버스 생성
+      # ============================================================
       - name: 스캐너2 유니버스 생성
         run: |
-          python scanner2/auto_universe.py
+          python auto_universe.py
 
+      # ============================================================
+      # 6. Scanner 2 실행
+      # ============================================================
       - name: 스캐너 2 실행
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python scanner2/option_flow_scanner_v2.py
+          python option_flow_scanner_v2.py
 
+      # ============================================================
+      # 7. 결과 파일 확인
+      # ============================================================
+      - name: 결과 파일 확인
+        if: always()
+        run: |
+          echo "========================================"
+          echo "SCANNER 2 RESULT FILES"
+          echo "========================================"
+
+          if [ -d "03_RESULTS" ]; then
+            find 03_RESULTS -type f | sort
+          else
+            echo "03_RESULTS 폴더 없음"
+          fi
+
+          if [ -d "01_DATA" ]; then
+            find 01_DATA -type f | sort
+          else
+            echo "01_DATA 폴더 없음"
+          fi
+
+          echo "========================================"
+
+      # ============================================================
+      # 8. 결과 업로드
+      # ============================================================
       - name: 스캐너 결과 업로드
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scanner2-results
           path: |
-            03_RESULTS/daily/
-            01_DATA/market/
+            03_RESULTS/
+            01_DATA/
           if-no-files-found: ignore
