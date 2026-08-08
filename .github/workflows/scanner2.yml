@@ -1,21 +1,19 @@
-name: OPTION FLOW SCANNER 2
+name: OPTION FLOW SCANNER V2
 
 on:
-  # 매일 자동 실행
-  schedule:
-    # 한국시간 매일 오후 11시
-    # UTC 기준 14:00
-    - cron: "0 14 * * *"
-
-  # GitHub Actions 화면에서 수동 실행
   workflow_dispatch:
 
-permissions:
-  contents: write
+  schedule:
+    # 한국시간 기준 매일 오후 11시
+    # GitHub Actions는 UTC 기준
+    - cron: "0 14 * * 1-5"
 
 jobs:
-  scanner2:
+  scanner:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
 
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -23,107 +21,51 @@ jobs:
 
     steps:
 
-      # ======================================================
-      # 1. GitHub 저장소 가져오기
-      # ======================================================
+      # --------------------------------------------------
+      # 1. Repository
+      # --------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ======================================================
-      # 2. Python 설치
-      # ======================================================
+      # --------------------------------------------------
+      # 2. Python
+      # --------------------------------------------------
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      # ======================================================
-      # 3. Python 패키지 설치
-      # ======================================================
+      # --------------------------------------------------
+      # 3. Install packages
+      # --------------------------------------------------
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy yfinance
+          pip install -r requirements.txt
 
-      # ======================================================
-      # 4. 폴더 확인
-      # ======================================================
-      - name: Check Scanner 2 files
+      # --------------------------------------------------
+      # 4. Run Scanner 2
+      # --------------------------------------------------
+
+      - name: Run Option Flow Scanner V2
+        working-directory: "02_PROGRAM"
         run: |
-          echo "=========================================="
-          echo "OPTION FLOW SCANNER 2"
-          echo "=========================================="
+          python option_flow_scanner_v2.py
 
-          echo ""
-          echo "[02_PROGRAM]"
-          ls -la "02_PROGRAM"
+      # --------------------------------------------------
+      # 5. Save generated CSV back to GitHub
+      # --------------------------------------------------
 
-          echo ""
-          echo "[01_DATA]"
-          ls -la "01_DATA" || true
-
-          echo ""
-          echo "[03_RESULTS]"
-          ls -la "03_RESULTS" || true
-
-      # ======================================================
-      # 5. Telegram Secret 확인
-      # ======================================================
-      - name: Check Telegram settings
-        run: |
-          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
-            echo "ERROR: TELEGRAM_BOT_TOKEN is not set"
-            exit 1
-          fi
-
-          if [ -z "$TELEGRAM_CHAT_ID" ]; then
-            echo "ERROR: TELEGRAM_CHAT_ID is not set"
-            exit 1
-          fi
-
-          echo "Telegram Secrets: OK"
-
-      # ======================================================
-      # 6. Universe 생성
-      # ======================================================
-      - name: Run auto universe
-        run: |
-          python "02_PROGRAM/auto_universe.py"
-
-      # ======================================================
-      # 7. OPTION FLOW SCANNER V2 실행
-      # ======================================================
-      - name: Run Scanner 2
-        run: |
-          python "02_PROGRAM/option_flow_scanner_v2.py"
-
-      # ======================================================
-      # 8. 결과 확인
-      # ======================================================
-      - name: Check results
-        if: always()
-        run: |
-          echo "=========================================="
-          echo "SCANNER 2 RESULT"
-          echo "=========================================="
-
-          if [ -d "03_RESULTS/daily" ]; then
-            ls -lah "03_RESULTS/daily"
-          else
-            echo "03_RESULTS/daily directory not found"
-          fi
-
-      # ======================================================
-      # 9. 결과 CSV GitHub 저장
-      # ======================================================
-      - name: Commit results
-        if: success()
+      - name: Commit scanner results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add "03_RESULTS/daily" || true
+          git add 03_RESULTS/
 
           git diff --cached --quiet || git commit -m "Update Scanner 2 results"
 
-          git push || true
+          git push
