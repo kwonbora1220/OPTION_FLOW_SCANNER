@@ -1,47 +1,45 @@
-name: OPTION FLOW SCANNER V2
+name: Scanner 2
 
 on:
-  workflow_dispatch:
-
   schedule:
+    # 한국시간 화~토 오전 6시
+    # UTC 월~금 21:00
     - cron: "00 21 * * 1-5"
 
+  # GitHub Actions에서 수동 실행 가능
   workflow_dispatch:
+
 jobs:
-
   scanner2:
-
     runs-on: ubuntu-latest
-
     timeout-minutes: 30
 
     steps:
-
-      - name: Checkout repository
+      - name: 체크아웃 저장소
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 파이썬 설정
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: 종속성 설치
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Create scanner2 universe
+      - name: 스캐너2 유니버스 생성
         run: |
           python scanner2/auto_universe.py
 
-      - name: Run Scanner 2
+      - name: 스캐너 2 실행
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python scanner2/option_flow_scanner_v2.py
 
-      - name: Upload scanner results
+      - name: 스캐너 결과 업로드
         if: always()
         uses: actions/upload-artifact@v4
         with:
