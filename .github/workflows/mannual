@@ -1,0 +1,954 @@
+name: PORTFOLIO OPTION SCANNER V2
+
+on:
+
+  # 수동 실행
+  workflow_dispatch:
+
+  # 한국시간 저녁 9:00
+  # UTC 12:00
+
+  schedule:
+    - cron: "0 10 * * *"
+
+
+permissions:
+
+  contents: write
+
+
+jobs:
+
+  portfolio-scanner:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ======================================================
+      # 1. CHECKOUT
+      # ======================================================
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+
+        with:
+          fetch-depth: 1
+
+
+      # ======================================================
+      # 2. SETUP PYTHON
+      # ======================================================
+
+      - name: Setup Python
+
+        uses: actions/setup-python@v5
+
+        with:
+          python-version: "3.12"
+
+
+      # ======================================================
+      # 3. INSTALL DEPENDENCIES
+      # ======================================================
+
+      - name: Install dependencies
+
+        run: |
+
+          python -m pip install --upgrade pip
+
+          python -m pip install \
+            pandas \
+            requests \
+            yfinance \
+            numpy
+
+
+      # ======================================================
+      # 4. BASIC ENVIRONMENT CHECK
+      # ======================================================
+
+      - name: Check environment
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🔥 ENVIRONMENT CHECK"
+          echo "=========================================="
+
+          echo ""
+
+          echo "PWD:"
+          pwd
+
+          echo ""
+
+          echo "GITHUB_WORKSPACE:"
+          echo "$GITHUB_WORKSPACE"
+
+          echo ""
+
+          echo "PYTHON:"
+          which python
+
+          python --version
+
+          echo ""
+
+          echo "PIP:"
+          python -m pip --version
+
+          echo ""
+
+          echo "ROOT FILES:"
+          ls -lah
+
+          echo ""
+
+          echo "PYTHON FILES:"
+          find "$GITHUB_WORKSPACE" \
+            -type f \
+            -name "*.py" \
+            -print
+
+
+      # ======================================================
+      # 5. FORCE PYTHON TO USE REPOSITORY ROOT
+      # ======================================================
+
+      - name: Configure Python path
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🐍 PYTHON PATH CONFIGURATION"
+          echo "=========================================="
+
+          echo ""
+
+          echo "PYTHONPATH=$GITHUB_WORKSPACE"
+
+          echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
+          echo ""
+
+          export PYTHONPATH="$GITHUB_WORKSPACE"
+
+          python - <<'PY'
+
+          import os
+          import sys
+
+          print("==========================================")
+          print("PYTHON EXECUTABLE")
+          print("==========================================")
+
+          print(sys.executable)
+
+          print("")
+
+          print("PYTHON VERSION")
+
+          print(sys.version)
+
+          print("")
+
+          print("PYTHONPATH")
+
+          print(os.environ.get("PYTHONPATH"))
+
+          print("")
+
+          print("SYS.PATH")
+
+          for p in sys.path:
+              print(p)
+
+          PY
+
+
+      # ======================================================
+      # 6. CHECK OPTION SEARCH FILE
+      # ======================================================
+
+      - name: Verify option_search.py
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🔎 VERIFY OPTION_SEARCH.PY"
+          echo "=========================================="
+
+          echo ""
+
+          echo "Searching option_search.py..."
+
+          find "$GITHUB_WORKSPACE" \
+            -type f \
+            -name "option_search.py" \
+            -print
+
+          echo ""
+
+          OPTION_SEARCH_COUNT=$(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -name "option_search.py" \
+              | wc -l
+          )
+
+          echo "option_search.py count: $OPTION_SEARCH_COUNT"
+
+          echo ""
+
+          if [ "$OPTION_SEARCH_COUNT" -eq 0 ]; then
+
+            echo "❌ option_search.py NOT FOUND"
+
+            exit 1
+
+          fi
+
+          if [ "$OPTION_SEARCH_COUNT" -gt 1 ]; then
+
+            echo "⚠️ WARNING:"
+            echo "Multiple option_search.py files detected."
+
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -name "option_search.py" \
+              -print
+
+          fi
+
+          echo ""
+
+          echo "ROOT option_search.py:"
+
+          ls -lah "$GITHUB_WORKSPACE/option_search.py"
+
+          echo ""
+
+          echo "Checking format_money definition..."
+
+          grep -n \
+            "def format_money" \
+            "$GITHUB_WORKSPACE/option_search.py" \
+            || true
+
+          echo ""
+
+          if ! grep -q \
+            "def format_money" \
+            "$GITHUB_WORKSPACE/option_search.py"; then
+
+            echo "❌ format_money() definition NOT FOUND"
+
+            exit 1
+
+          fi
+
+          echo "✅ format_money() definition FOUND"
+
+
+      # ======================================================
+      # 7. PYTHON COMPILE CHECK
+      # ======================================================
+
+      - name: Compile Python files
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🐍 PYTHON COMPILE CHECK"
+          echo "=========================================="
+
+          echo ""
+
+          python -m py_compile \
+            "$GITHUB_WORKSPACE/option_search.py"
+
+          python -m py_compile \
+            "$GITHUB_WORKSPACE/batch_option_search.py"
+
+          python -m py_compile \
+            "$GITHUB_WORKSPACE/selected_symbols.py"
+
+          echo ""
+
+          echo "✅ PYTHON COMPILE CHECK PASSED"
+
+
+      # ======================================================
+      # 8. CLEAN PYTHON CACHE
+      # ======================================================
+
+      - name: Clean Python cache
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🧹 CLEAN PYTHON CACHE"
+          echo "=========================================="
+
+          find "$GITHUB_WORKSPACE" \
+            -type d \
+            -name "__pycache__" \
+            -prune \
+            -exec rm -rf {} +
+
+          find "$GITHUB_WORKSPACE" \
+            -type f \
+            -name "*.pyc" \
+            -delete
+
+          echo ""
+
+          echo "✅ PYTHON CACHE CLEANED"
+
+
+      # ======================================================
+      # 9. DIRECT IMPORT TEST
+      # ======================================================
+
+      - name: Test option_search import
+
+        env:
+
+          PYTHONIOENCODING: utf-8
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🧪 OPTION_SEARCH IMPORT TEST"
+          echo "=========================================="
+
+          echo ""
+
+          cd "$GITHUB_WORKSPACE"
+
+          python - <<'PY'
+
+          import os
+          import sys
+          import importlib
+
+          print("==========================================")
+          print("IMPORT TEST")
+          print("==========================================")
+
+          print("")
+
+          print("Current directory:")
+          print(os.getcwd())
+
+          print("")
+
+          print("Python executable:")
+          print(sys.executable)
+
+          print("")
+
+          print("Python path:")
+
+          for p in sys.path:
+              print("  ", p)
+
+          print("")
+
+          import option_search
+
+          print("==========================================")
+          print("IMPORTED MODULE")
+          print("==========================================")
+
+          print("")
+
+          print("module:")
+          print(option_search)
+
+          print("")
+
+          print("module file:")
+          print(option_search.__file__)
+
+          print("")
+
+          print("format_money exists:")
+
+          print(
+              hasattr(
+                  option_search,
+                  "format_money"
+              )
+          )
+
+          print("")
+
+          if not hasattr(
+              option_search,
+              "format_money"
+          ):
+
+              raise RuntimeError(
+                  "❌ option_search.format_money NOT FOUND"
+              )
+
+          print("format_money test:")
+
+          print(
+              option_search.format_money(
+                  1234567
+              )
+          )
+
+          print("")
+
+          print("analyze_ticker exists:")
+
+          print(
+              hasattr(
+                  option_search,
+                  "analyze_ticker"
+              )
+          )
+
+          print("")
+
+          if not hasattr(
+              option_search,
+              "analyze_ticker"
+          ):
+
+              raise RuntimeError(
+                  "❌ option_search.analyze_ticker NOT FOUND"
+              )
+
+          print("")
+
+          print("==========================================")
+          print("✅ OPTION_SEARCH IMPORT TEST PASSED")
+          print("==========================================")
+
+          PY
+
+
+      # ======================================================
+      # 10. CHECK BATCH IMPORT
+      # ======================================================
+
+      - name: Test batch_option_search import
+
+        env:
+
+          PYTHONIOENCODING: utf-8
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🧪 BATCH IMPORT TEST"
+          echo "=========================================="
+
+          echo ""
+
+          cd "$GITHUB_WORKSPACE"
+
+          python - <<'PY'
+
+          import batch_option_search
+
+          print("==========================================")
+          print("BATCH MODULE")
+          print("==========================================")
+
+          print("")
+
+          print(
+              "module file:",
+              batch_option_search.__file__
+          )
+
+          print("")
+
+          print(
+              "format_money:",
+              hasattr(
+                  batch_option_search,
+                  "format_money"
+              )
+          )
+
+          print("")
+
+          print(
+              "calculate_score:",
+              hasattr(
+                  batch_option_search,
+                  "calculate_score"
+              )
+          )
+
+          print("")
+
+          print(
+              "SELECTED_SYMBOLS:",
+              len(
+                  batch_option_search.SELECTED_SYMBOLS
+              )
+          )
+
+          print("")
+
+          print("==========================================")
+          print("✅ BATCH IMPORT TEST PASSED")
+          print("==========================================")
+
+          PY
+
+
+      # ======================================================
+      # 11. SHOW SELECTED SYMBOLS
+      # ======================================================
+
+      - name: Show selected symbols
+
+        env:
+
+          PYTHONIOENCODING: utf-8
+
+        run: |
+
+          set -e
+
+          cd "$GITHUB_WORKSPACE"
+
+          python - <<'PY'
+
+          from selected_symbols import SELECTED_SYMBOLS
+
+          print("")
+          print("==========================================")
+          print("📊 SELECTED SYMBOLS")
+          print("==========================================")
+          print("")
+
+          print(
+              f"총 종목 수: "
+              f"{len(SELECTED_SYMBOLS)}"
+          )
+
+          print("")
+
+          for i, ticker in enumerate(
+              SELECTED_SYMBOLS,
+              1
+          ):
+
+              print(
+                  f"{i:02d}. {ticker}"
+              )
+
+          print("")
+
+          if len(SELECTED_SYMBOLS) == 0:
+
+              raise RuntimeError(
+                  "❌ SELECTED_SYMBOLS is empty"
+              )
+
+          PY
+
+
+      # ======================================================
+      # 12. RUN PORTFOLIO OPTION SCANNER
+      # ======================================================
+
+      - name: Run Portfolio Option Scanner
+
+        env:
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          PYTHONIOENCODING: utf-8
+
+          PYTHONPATH: ${{ github.workspace }}
+
+        run: |
+
+          set -e
+
+          cd "$GITHUB_WORKSPACE"
+
+          echo "=========================================="
+          echo "🔥 PORTFOLIO OPTION SCANNER START"
+          echo "=========================================="
+
+          echo ""
+
+          echo "Working directory:"
+          pwd
+
+          echo ""
+
+          echo "Python:"
+          which python
+
+          python --version
+
+          echo ""
+
+          echo "PYTHONPATH:"
+          echo "$PYTHONPATH"
+
+          echo ""
+
+          echo "=========================================="
+          echo "🔥 RUNNING batch_option_search.py"
+          echo "=========================================="
+
+          echo ""
+
+          python "$GITHUB_WORKSPACE/batch_option_search.py"
+
+          echo ""
+
+          echo "=========================================="
+          echo "🔥 PORTFOLIO OPTION SCANNER FINISHED"
+          echo "=========================================="
+
+
+      # ======================================================
+      # 13. FIND OPTION SEARCH CSV
+      # ======================================================
+
+      - name: Find OPTION SEARCH CSV
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🔎 OPTION SEARCH CSV"
+          echo "=========================================="
+
+          echo ""
+
+          find "$GITHUB_WORKSPACE" \
+            -type f \
+            -name "*_OPTION_SEARCH.csv" \
+            -print
+
+          echo ""
+
+          COUNT=$(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -name "*_OPTION_SEARCH.csv" \
+              | wc -l
+          )
+
+          echo "OPTION SEARCH CSV COUNT: $COUNT"
+
+          echo ""
+
+          if [ "$COUNT" -eq 0 ]; then
+
+            echo "❌ OPTION SEARCH CSV NOT FOUND"
+
+            exit 1
+
+          fi
+
+          echo ""
+
+          echo "✅ OPTION SEARCH CSV FOUND"
+
+
+      # ======================================================
+      # 14. CHECK FINAL RANKING
+      # ======================================================
+
+      - name: Check final ranking CSV
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "🔎 FINAL RANKING CSV"
+          echo "=========================================="
+
+          echo ""
+
+          find "$GITHUB_WORKSPACE" \
+            -type f \
+            -name "OPTION_FINAL_RANKING.csv" \
+            -print
+
+          echo ""
+
+          FINAL_FILE="$GITHUB_WORKSPACE/03_RESULTS/daily/OPTION_FINAL_RANKING.csv"
+
+          if [ ! -f "$FINAL_FILE" ]; then
+
+            echo "❌ FINAL RANKING CSV NOT FOUND"
+
+            echo ""
+
+            echo "Available CSV files:"
+
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -name "*.csv" \
+              -print
+
+            exit 1
+
+          fi
+
+          echo "✅ FINAL RANKING CSV FOUND"
+
+          echo ""
+
+          echo "=========================================="
+          echo "📊 FINAL RANKING"
+          echo "=========================================="
+
+          echo ""
+
+          cat "$FINAL_FILE"
+
+
+      # ======================================================
+      # 15. CHECK RESULT FILE COUNT
+      # ======================================================
+
+      - name: Check result files
+
+        run: |
+
+          set -e
+
+          echo "=========================================="
+          echo "📊 RESULT FILE CHECK"
+          echo "=========================================="
+
+          echo ""
+
+          RESULT_DIR="$GITHUB_WORKSPACE/03_RESULTS/daily"
+
+          if [ ! -d "$RESULT_DIR" ]; then
+
+            echo "❌ RESULT DIRECTORY NOT FOUND"
+
+            exit 1
+
+          fi
+
+          echo "Result directory:"
+          echo "$RESULT_DIR"
+
+          echo ""
+
+          echo "Files:"
+
+          find "$RESULT_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -print
+
+          echo ""
+
+          COUNT=$(
+            find "$RESULT_DIR" \
+              -maxdepth 1 \
+              -type f \
+              -name "*.csv" \
+              | wc -l
+          )
+
+          echo "CSV COUNT: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+
+            echo "❌ NO RESULT CSV"
+
+            exit 1
+
+          fi
+
+          echo ""
+
+          echo "✅ RESULT FILES FOUND"
+
+
+      # ======================================================
+      # 16. UPLOAD RESULTS
+      # ======================================================
+
+      - name: Upload scanner results
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: portfolio-option-results
+
+          path: |
+
+            03_RESULTS/daily/*.csv
+
+          if-no-files-found: error
+
+
+      # ======================================================
+      # 17. SAVE OI SNAPSHOTS TO GITHUB
+      # ======================================================
+
+      - name: Persist OI snapshots
+
+        run: |
+
+          set -e
+
+          cd "$GITHUB_WORKSPACE"
+
+          echo "=========================================="
+          echo "💾 PERSIST OI SNAPSHOTS"
+          echo "=========================================="
+
+          echo ""
+
+          OI_HISTORY_DIR="$GITHUB_WORKSPACE/03_RESULTS/daily/oi_history"
+
+          if [ ! -d "$OI_HISTORY_DIR" ]; then
+
+            echo "⚠️ OI history directory does not exist."
+
+            echo "Nothing to commit."
+
+            exit 0
+
+          fi
+
+          echo "OI history directory:"
+          echo "$OI_HISTORY_DIR"
+
+          echo ""
+
+          echo "Snapshot files:"
+
+          find "$OI_HISTORY_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*_OI_*.csv" \
+            -print
+
+          echo ""
+
+          git config user.name "github-actions[bot]"
+
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "=========================================="
+          echo "📦 GIT ADD"
+          echo "=========================================="
+
+          git add \
+            03_RESULTS/daily/oi_history/*.csv
+
+          echo ""
+
+          if git diff --cached --quiet; then
+
+            echo "ℹ️ 변경된 OI snapshot이 없습니다."
+
+            echo "Git commit/push를 건너뜁니다."
+
+            exit 0
+
+          fi
+
+          echo "=========================================="
+          echo "📝 GIT COMMIT"
+          echo "=========================================="
+
+          git commit \
+            -m "Persist OI snapshots"
+
+          echo ""
+
+          echo "=========================================="
+          echo "🚀 GIT PUSH"
+          echo "=========================================="
+
+          git push
+
+          echo ""
+
+          echo "✅ OI snapshots committed and pushed."
+
+
+      # ======================================================
+      # 18. DONE
+      # ======================================================
+
+      - name: Scanner completed
+
+        run: |
+
+          echo ""
+
+          echo "=========================================="
+
+          echo "✅ PORTFOLIO OPTION SCANNER V2 COMPLETE"
+
+          echo "=========================================="
+
+          echo ""
+
+          echo "분석 종목:"
+
+          python - <<'PY'
+
+          from selected_symbols import SELECTED_SYMBOLS
+
+          print(
+              f"{len(SELECTED_SYMBOLS)}개"
+          )
+
+          PY
+
+          echo ""
+
+          echo "결과 위치:"
+
+          echo "03_RESULTS/daily/"
+
+          echo ""
+
+          echo "OI Snapshot 위치:"
+
+          echo "03_RESULTS/daily/oi_history/"
+
+          echo ""
+
+          echo "=========================================="
