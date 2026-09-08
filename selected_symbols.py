@@ -18,7 +18,7 @@ SELECTED_SYMBOLS = [
     "POET",
     "CBRS",
     "NVTS",
-    "VST",
+    "XYZ",
     "IREN",
     "OKLO",
     "ORCL",
