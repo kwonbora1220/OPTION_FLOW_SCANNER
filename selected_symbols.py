@@ -27,7 +27,7 @@ SELECTED_SYMBOLS = [
     "LUNR",
     "CRCL",
     "SPCX",
-    "EWZ",
+    "RUN",
     "EWY",
     "REMX",
     "MSTR",
