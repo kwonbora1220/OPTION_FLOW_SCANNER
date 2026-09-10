@@ -4,7 +4,7 @@
 
 SELECTED_SYMBOLS = [
     "DKNG",
-    "AVGO",
+    "NVO",
     "NVDA",
     "MRVL",
     "NBIS",
