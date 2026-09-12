@@ -901,6 +901,12 @@ def calculate_score(
         "put_distance":
             put_distance,
 
+        "put_wall_support_score":
+            put_wall_support_score,
+
+        "upside_room":
+            upside_room,
+
         "iv_pct":
             iv_pct,
 
