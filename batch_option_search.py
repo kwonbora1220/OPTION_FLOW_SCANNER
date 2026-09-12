@@ -473,7 +473,13 @@ def calculate_score(
 
 
     # ========================================================
-    # 9. WALL
+    # 9. WALL STRUCTURE
+    #
+    # 핵심:
+    # - Put Wall은 강한 하방 지지 후보
+    # - 현재가가 Put Wall에 가까울수록 매수 매력 증가
+    # - Put Wall을 이미 하향 이탈하면 강한 감점
+    # - Call Wall이 가까우면 상방 여유 부족으로 감점
     # ========================================================
 
     call_wall = walls.get(
@@ -485,43 +491,15 @@ def calculate_score(
     )
 
     call_distance = None
-
     put_distance = None
 
+    put_wall_support_score = 0.0
+    upside_room = None
 
-    if (
-        call_wall is not None
-        and current_price
-        and current_price > 0
-    ):
 
-        call_distance = (
-            (
-                call_wall
-                - current_price
-            )
-            / current_price
-            * 100
-        )
-
-        if (
-            0 <= call_distance <= 3
-        ):
-
-            score -= 5
-
-            reasons.append(
-                "Call Wall 바로 아래"
-            )
-
-        elif call_distance >= 8:
-
-            score += 2
-
-            reasons.append(
-                "상방 여유 구간"
-            )
-
+    # ========================================================
+    # 9-1. PUT WALL
+    # ========================================================
 
     if (
         put_wall is not None
@@ -538,24 +516,238 @@ def calculate_score(
             * 100
         )
 
-        if (
-            0 <= put_distance <= 3
-        ):
+        # ----------------------------------------------------
+        # Put Wall 하향 이탈
+        # ----------------------------------------------------
 
-            score -= 5
+        if put_distance < 0:
+
+            score -= 12
+
+            bearish_signals += 1
 
             reasons.append(
-                "Put Wall 바로 위"
+                "⚠️ Put Wall 하향 이탈"
             )
 
-        elif put_distance >= 8:
+
+        # ----------------------------------------------------
+        # Put Wall 바로 위
+        # 가장 강한 매수 후보 구간
+        # ----------------------------------------------------
+
+        elif put_distance <= 2:
+
+            score += 12
+
+            put_wall_support_score = 12
+
+            reasons.append(
+                "🟢 Put Wall 초근접 지지"
+            )
+
+
+        # ----------------------------------------------------
+        # Put Wall 2~4%
+        # ----------------------------------------------------
+
+        elif put_distance <= 4:
+
+            score += 9
+
+            put_wall_support_score = 9
+
+            reasons.append(
+                "🟢 Put Wall 근접"
+            )
+
+
+        # ----------------------------------------------------
+        # Put Wall 4~6%
+        # ----------------------------------------------------
+
+        elif put_distance <= 6:
+
+            score += 6
+
+            put_wall_support_score = 6
+
+            reasons.append(
+                "Put Wall 지지권"
+            )
+
+
+        # ----------------------------------------------------
+        # Put Wall 6~10%
+        # ----------------------------------------------------
+
+        elif put_distance <= 10:
+
+            score += 2
+
+            put_wall_support_score = 2
+
+            reasons.append(
+                "Put Wall 하방 완충"
+            )
+
+
+        # ----------------------------------------------------
+        # 너무 멀리 떨어짐
+        # ----------------------------------------------------
+
+        else:
+
+            put_wall_support_score = 0
+
+            reasons.append(
+                "Put Wall과 거리 있음"
+            )
+
+
+    # ========================================================
+    # 9-2. CALL WALL
+    # ========================================================
+
+    if (
+        call_wall is not None
+        and current_price
+        and current_price > 0
+    ):
+
+        call_distance = (
+            (
+                call_wall
+                - current_price
+            )
+            / current_price
+            * 100
+        )
+
+        # ----------------------------------------------------
+        # 현재가 위에 Call Wall이 있는 정상 구조
+        # ----------------------------------------------------
+
+        if call_distance >= 0:
+
+            upside_room = call_distance
+
+            # Call Wall 바로 아래
+            # 상승 여유가 거의 없으므로 감점
+
+            if call_distance <= 3:
+
+                score -= 7
+
+                reasons.append(
+                    "⚠️ Call Wall 바로 아래"
+                )
+
+            elif call_distance <= 6:
+
+                score -= 3
+
+                reasons.append(
+                    "Call Wall 근접"
+                )
+
+            elif call_distance >= 10:
+
+                score += 3
+
+                reasons.append(
+                    "🟢 Call Wall 상방 여유"
+                )
+
+            else:
+
+                reasons.append(
+                    "Call Wall 상방 여유"
+                )
+
+
+        # ----------------------------------------------------
+        # 현재가가 Call Wall을 이미 돌파한 경우
+        # ----------------------------------------------------
+
+        else:
+
+            upside_room = 0
 
             score += 2
 
             reasons.append(
-                "하방 완충 여유"
+                "🟢 Call Wall 돌파"
             )
 
+
+    # ========================================================
+    # 9-3. PUT WALL → CALL WALL 구조
+    #
+    # Put Wall은 가까우면서
+    # Call Wall은 충분히 멀리 있는 종목을 우선
+    # ========================================================
+
+    if (
+        put_distance is not None
+        and call_distance is not None
+        and put_distance >= 0
+        and call_distance > 0
+    ):
+
+        # 좋은 구조:
+        # Put Wall <= 6%
+        # Call Wall >= 8%
+
+        if (
+            put_distance <= 6
+            and call_distance >= 8
+        ):
+
+            score += 5
+
+            reasons.append(
+                "🟢 Put Wall 지지 + 상방 여유"
+            )
+
+
+        # 매우 좋은 구조:
+        # Put Wall <= 4%
+        # Call Wall >= 10%
+
+        if (
+            put_distance <= 4
+            and call_distance >= 10
+        ):
+
+            score += 4
+
+            reasons.append(
+                "🔥 강한 매수 구조"
+            )
+
+
+    # ========================================================
+    # 9-4. PUT WALL 이탈 + CALL WALL 근접
+    #
+    # 가장 피해야 하는 구조
+    # ========================================================
+
+    if (
+        put_distance is not None
+        and call_distance is not None
+    ):
+
+        if (
+            put_distance < 0
+            and call_distance <= 5
+        ):
+
+            score -= 8
+
+            reasons.append(
+                "🔴 Put Wall 이탈 + 상방 여유 부족"
+            )
 
     # ========================================================
     # 10. SIGNAL CONFLICT
