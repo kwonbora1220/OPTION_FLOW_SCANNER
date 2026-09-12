@@ -1052,6 +1052,26 @@ def make_final_result(
                 0
             ),
 
+        "call_wall_distance":
+            score_data.get(
+                "call_distance"
+            ),
+
+        "put_wall_distance":
+            score_data.get(
+                "put_distance"
+            ),
+
+        "put_wall_support_score":
+            score_data.get(
+                "put_wall_support_score"
+            ),
+
+        "upside_room":
+            score_data.get(
+                "upside_room"
+            ),
+
         "quality":
             quality.get(
                 "score",
