@@ -542,6 +542,8 @@ def calculate_score(
 
             put_wall_support_score = 12
 
+            bullish_signals += 1
+
             reasons.append(
                 "🟢 Put Wall 초근접 지지"
             )
@@ -557,6 +559,8 @@ def calculate_score(
 
             put_wall_support_score = 9
 
+            bullish_signals += 1
+
             reasons.append(
                 "🟢 Put Wall 근접"
             )
@@ -571,6 +575,8 @@ def calculate_score(
             score += 6
 
             put_wall_support_score = 6
+
+            bullish_signals += 1
 
             reasons.append(
                 "Put Wall 지지권"
