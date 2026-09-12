@@ -1169,16 +1169,36 @@ def save_ranking(
             "call_premium_ratio":
                 r["call_premium_ratio"],
 
-            "call_wall":
-                r["call_wall"],
+                        "call_wall": 
+                r["call_wall"], 
 
-            "put_wall":
-                r["put_wall"],
+            "put_wall": 
+                r["put_wall"], 
 
-            "call_wall_gex":
-                r["call_wall_gex"],
+            "call_wall_distance":
+                r.get(
+                    "call_wall_distance"
+                ),
 
-            "put_wall_gex":
+            "put_wall_distance":
+                r.get(
+                    "put_wall_distance"
+                ),
+
+            "put_wall_support_score":
+                r.get(
+                    "put_wall_support_score"
+                ),
+
+            "upside_room":
+                r.get(
+                    "upside_room"
+                ),
+
+            "call_wall_gex": 
+                r["call_wall_gex"], 
+
+            "put_wall_gex": 
                 r["put_wall_gex"],
 
             "data_quality":
