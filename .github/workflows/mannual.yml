@@ -5,11 +5,10 @@ on:
   # 수동 실행
   workflow_dispatch:
 
-  # 한국시간 저녁 9:00
-  # UTC 12:00
-
+  # 한국시간 매일 20:00
   schedule:
-    - cron: "0 11 * * *"
+    - cron: "0 20 * * *"
+      timezone: "Asia/Seoul"
 
 
 permissions:
