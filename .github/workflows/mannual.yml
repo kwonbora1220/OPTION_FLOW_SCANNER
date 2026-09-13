@@ -113,14 +113,11 @@ jobs:
           echo "should_run=true" >> "$GITHUB_OUTPUT"
           echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
 
-
   portfolio-scanner:
 
     needs: schedule-gate
 
     if: needs.schedule-gate.outputs.should_run == 'true'
-
-  portfolio-scanner:
 
     runs-on: ubuntu-latest
 
