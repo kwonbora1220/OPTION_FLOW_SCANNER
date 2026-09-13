@@ -5,9 +5,11 @@ on:
   # 수동 실행
   workflow_dispatch:
 
-  # 한국시간 매일 20:00
+  # 한국시간 20:00 이후 15분 간격으로 실행 시도
+  # GitHub Actions의 schedule 지연에 대비한 보조 스케줄
+  # 실제 스캐너는 하루 1회만 실행되도록 아래 GATE에서 차단
   schedule:
-    - cron: "0 20 * * *"
+    - cron: "*/15 20-23 * * *"
       timezone: "Asia/Seoul"
 
 
@@ -16,7 +18,107 @@ permissions:
   contents: write
 
 
+# 여러 scheduled run이 동시에 실행되는 것을 방지
+# 앞선 실행이 끝난 뒤 다음 실행이 시작되더라도
+# GATE가 오늘 실행 여부를 다시 확인함
+concurrency:
+  group: portfolio-option-scanner
+  cancel-in-progress: false
+
 jobs:
+
+  # ======================================================
+  # 0. SCHEDULE GATE
+  # ======================================================
+  # GitHub Actions가 20:00을 놓쳐도 20:00~23:59 사이
+  # 다음 scheduled run에서 실행할 수 있도록 함.
+  # 단, 하루에 실제 스캐너는 1회만 실행.
+
+  schedule-gate:
+
+    runs-on: ubuntu-latest
+
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      target_date: ${{ steps.gate.outputs.target_date }}
+
+    steps:
+
+      - name: Checkout repository for schedule gate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check Korea schedule and daily marker
+        id: gate
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -e
+
+          echo "=========================================="
+          echo "⏰ PORTFOLIO SCANNER SCHEDULE GATE"
+          echo "=========================================="
+
+          TODAY=$(TZ=Asia/Seoul date +%Y-%m-%d)
+          NOW=$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S')
+          HOUR=$(TZ=Asia/Seoul date +%H)
+          MINUTE=$(TZ=Asia/Seoul date +%M)
+
+          # 20:00 스케줄이 GitHub에서 자정 직후까지 지연될 수 있으므로
+          # 00:00~01:59에 시작된 scheduled run은 전날 실행으로 처리
+          if [ "$HOUR" -lt 2 ]; then
+            TARGET_DATE=$(TZ=Asia/Seoul date -d 'yesterday' +%Y-%m-%d)
+          else
+            TARGET_DATE="$TODAY"
+          fi
+
+          echo "현재 한국시간: $NOW"
+          echo "실행 이벤트: $GH_EVENT_NAME"
+          echo "오늘 날짜: $TODAY"
+          echo "스캔 대상 날짜: $TARGET_DATE"
+
+          # 수동 실행은 기존처럼 언제든 실행 허용
+          if [ "$GH_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "🟢 수동 실행 → 실행 허용"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "target_date=$TODAY" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 02:00 이후에는 전날 지연 실행으로 간주하지 않음
+          if [ "$HOUR" -ge 2 ] && [ "$HOUR" -lt 20 ]; then
+            echo "🟡 실행 허용 시간이 아님 (20:00~01:59만 허용)"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MARKER="$GITHUB_WORKSPACE/.portfolio_scanner_last_run"
+
+          if [ -f "$MARKER" ]; then
+            LAST_RUN=$(tr -d '[:space:]' < "$MARKER")
+            echo "마지막 실행 날짜: $LAST_RUN"
+          else
+            LAST_RUN=""
+            echo "마지막 실행 기록: 없음"
+          fi
+
+          if [ "$LAST_RUN" = "$TARGET_DATE" ]; then
+            echo "🔵 오늘 이미 스캐너 실행 완료 → 중복 실행 차단"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "🟢 오늘 아직 실행하지 않음 → 스캐너 실행 허용"
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
+
+
+  portfolio-scanner:
+
+    needs: schedule-gate
+
+    if: needs.schedule-gate.outputs.should_run == 'true'
 
   portfolio-scanner:
 
@@ -582,6 +684,8 @@ jobs:
 
           PYTHONPATH: ${{ github.workspace }}
 
+          SCANNER_TARGET_DATE: ${{ needs.schedule-gate.outputs.target_date }}
+
         run: |
 
           set -e
@@ -834,14 +938,14 @@ jobs:
 
             echo "⚠️ OI history directory does not exist."
 
-            echo "Nothing to commit."
+            echo "OI snapshot 없이 실행 완료 마커만 저장합니다."
 
-            exit 0
+          else
+
+            echo "OI history directory:"
+            echo "$OI_HISTORY_DIR"
 
           fi
-
-          echo "OI history directory:"
-          echo "$OI_HISTORY_DIR"
 
           echo ""
 
@@ -863,14 +967,30 @@ jobs:
           echo "📦 GIT ADD"
           echo "=========================================="
 
-          git add \
-            03_RESULTS/daily/oi_history/*.csv
+          # 오늘 실행 완료 날짜를 저장하여 scheduled run 중복 실행 방지
+          TODAY=$(TZ=Asia/Seoul date +%Y-%m-%d)
+          TARGET_DATE="${SCANNER_TARGET_DATE:-$TODAY}"
+          echo "$TARGET_DATE" > .portfolio_scanner_last_run
+          echo "실행 완료 마커 날짜: $TARGET_DATE"
+
+          # OI snapshot이 있는 경우에만 CSV를 추가
+          if [ -d "$OI_HISTORY_DIR" ]; then
+            find "$OI_HISTORY_DIR" \
+              -maxdepth 1 \
+              -type f \
+              -name "*_OI_*.csv" \
+              -print0 \
+              | xargs -0 -r git add
+          fi
+
+          # OI snapshot 유무와 관계없이 실행 완료 마커는 반드시 저장
+          git add .portfolio_scanner_last_run
 
           echo ""
 
           if git diff --cached --quiet; then
 
-            echo "ℹ️ 변경된 OI snapshot이 없습니다."
+            echo "ℹ️ 변경된 OI snapshot과 실행 마커가 없습니다."
 
             echo "Git commit/push를 건너뜁니다."
 
@@ -883,7 +1003,7 @@ jobs:
           echo "=========================================="
 
           git commit \
-            -m "Persist OI snapshots"
+            -m "Persist OI snapshots and scanner run marker"
 
           echo ""
 
