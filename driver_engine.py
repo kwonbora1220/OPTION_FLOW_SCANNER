@@ -995,257 +995,200 @@ def choose_pattern_label(window):
 
 def ordered_outcome(df, end_idx, forward=FORWARD):
     """
-    v4: measure which threshold is reached first after a driver event.
-    Positive thresholds are evaluated against future HIGH; negative thresholds
-    against future LOW. This prevents +5% and -5% from both being counted as
-    separate 'wins' when both happened in the same forward window.
+    v5:
+    +5%, +10%, +20%와 -5% 손절 중
+    어느 쪽이 먼저 발생했는지 계산한다.
+
+    중요:
+    단순 hit rate가 아니라 시간 순서를 계산한다.
     """
-    if end_idx >= len(df) - 1:
-        return {
-            "first_event": "NO_FUTURE",
-            "first_day": np.nan,
-            "hit_5_before_stop5": np.nan,
-            "hit_10_before_stop5": np.nan,
-            "hit_20_before_stop5": np.nan,
-            "stop_5_before_hit5": np.nan,
-        }
-
-    entry = float(df["Close"].iloc[end_idx])
-    if not np.isfinite(entry) or entry <= 0:
-        return {
-            "first_event": "INVALID_ENTRY",
-            "first_day": np.nan,
-            "hit_5_before_stop5": np.nan,
-            "hit_10_before_stop5": np.nan,
-            "hit_20_before_stop5": np.nan,
-            "stop_5_before_hit5": np.nan,
-        }
-
-    stop5 = entry * 0.95
-    hit5 = entry * 1.05
-    hit10 = entry * 1.10
-    hit20 = entry * 1.20
-
-    end = min(len(df), end_idx + 1 + forward)
-    first5 = first10 = first20 = firststop = None
-
-    for j in range(end_idx + 1, end):
-        day = j - end_idx
-        hi = float(df["High"].iloc[j])
-        lo = float(df["Low"].iloc[j])
-
-        # Same-day collisions are conservatively treated as ambiguous.
-        pos = []
-        neg = []
-        if np.isfinite(hi):
-            if hi >= hit5: pos.append(("HIT_5", day))
-            if hi >= hit10: pos.append(("HIT_10", day))
-            if hi >= hit20: pos.append(("HIT_20", day))
-        if np.isfinite(lo) and lo <= stop5:
-            neg.append(("STOP_5", day))
-
-        if first5 is None and pos:
-            first5 = pos[0]
-        if first10 is None and any(x[0] == "HIT_10" for x in pos):
-            first10 = ("HIT_10", day)
-        if first20 is None and any(x[0] == "HIT_20" for x in pos):
-            first20 = ("HIT_20", day)
-        if firststop is None and neg:
-            firststop = neg[0]
-
-        # Determine earliest directional event for this day.
-        if first5 is not None or firststop is not None:
-            break
-
-    def before(a, b):
-        if a is None:
-            return np.nan
-        if b is None:
-            return 1.0
-        # If same day, mark as ambiguous rather than manufacturing a winner.
-        if a[1] == b[1]:
-            return np.nan
-        return 1.0 if a[1] < b[1] else 0.0
-
-    candidates = []
-    if first5:
-        candidates.append(first5)
-    if firststop:
-        candidates.append(firststop)
-
-    first_event = "NONE"
-    first_day = np.nan
-    if candidates:
-        candidates.sort(key=lambda x: x[1])
-        if len(candidates) >= 2 and candidates[0][1] == candidates[1][1]:
-            first_event = "AMBIGUOUS"
-        else:
-            first_event, first_day = candidates[0]
-
-    return {
-        "first_event": first_event,
-        "first_day": first_day,
-        "hit_5_before_stop5": before(first5, firststop),
-        "hit_10_before_stop5": before(first10, firststop),
-        "hit_20_before_stop5": before(first20, firststop),
-        "stop_5_before_hit5": before(firststop, first5),
-    }
-
-
-def future_outcome(
-    df,
-    end,
-):
 
     entry = float(
-        df[
-            "Close"
-        ].iloc[
-            end - 1
-        ]
-    )
-
-    if entry <= 0:
-        return {}
-
-    future = df.iloc[
-        end:
-        min(
-            end + FORWARD,
-            len(df),
-        )
-    ]
-
-    if future.empty:
-        return {}
-
-    high_ret = (
-        future[
-            "High"
-        ]
-        / entry
-        - 1
-    )
-
-    low_ret = (
-        future[
-            "Low"
-        ]
-        / entry
-        - 1
-    )
-
-    close_ret = (
-        future[
-            "Close"
-        ]
-        / entry
-        - 1
+        df["Close"].iloc[end_idx]
     )
 
     result = {
-        "forward_return": float(
-            close_ret.iloc[-1]
-        ),
-        "max_up": float(
-            high_ret.max()
-        ),
-        "max_down": float(
-            low_ret.min()
-        ),
+        "first_event": "NONE",
+        "first_day": np.nan,
+
+        "hit_5_before_stop5": np.nan,
+        "hit_10_before_stop5": np.nan,
+        "hit_20_before_stop5": np.nan,
+
+        "stop_5_before_hit5": np.nan,
     }
 
-    # --------------------------------------------------------
-    # +5 / +10 / +20 도달 여부
-    # --------------------------------------------------------
+    if (
+        not np.isfinite(entry)
+        or entry <= 0
+        or end_idx >= len(df) - 1
+    ):
+        return result
 
-    for target in [
-        0.05,
-        0.10,
-        0.20,
-    ]:
+    hit_5_level = entry * 1.05
+    hit_10_level = entry * 1.10
+    hit_20_level = entry * 1.20
 
-        reached = (
-            high_ret >= target
+    stop_5_level = entry * 0.95
+
+    first_hit_5 = None
+    first_hit_10 = None
+    first_hit_20 = None
+    first_stop_5 = None
+
+    last_idx = min(
+        len(df),
+        end_idx + 1 + int(forward),
+    )
+
+    for j in range(
+        end_idx + 1,
+        last_idx,
+    ):
+
+        day = j - end_idx
+
+        high = float(
+            df["High"].iloc[j]
         )
 
-        if reached.any():
+        low = float(
+            df["Low"].iloc[j]
+        )
 
-            first_position = (
-                int(
-                    np.argmax(
-                        reached.to_numpy()
-                    )
-                )
-                + 1
+        if (
+            first_hit_5 is None
+            and np.isfinite(high)
+            and high >= hit_5_level
+        ):
+            first_hit_5 = day
+
+        if (
+            first_hit_10 is None
+            and np.isfinite(high)
+            and high >= hit_10_level
+        ):
+            first_hit_10 = day
+
+        if (
+            first_hit_20 is None
+            and np.isfinite(high)
+            and high >= hit_20_level
+        ):
+            first_hit_20 = day
+
+        if (
+            first_stop_5 is None
+            and np.isfinite(low)
+            and low <= stop_5_level
+        ):
+            first_stop_5 = day
+
+    def before(
+        positive_day,
+        negative_day,
+    ):
+
+        if positive_day is None:
+            return np.nan
+
+        if negative_day is None:
+            return 1.0
+
+        # 같은 날 High/Low가 모두 충족되면
+        # 어느 쪽이 먼저인지 일봉 데이터만으로 알 수 없으므로
+        # 승/패 어느 쪽에도 넣지 않는다.
+        if positive_day == negative_day:
+            return np.nan
+
+        if positive_day < negative_day:
+            return 1.0
+
+        return 0.0
+
+    # --------------------------------------------------------
+    # +5% vs -5%
+    # --------------------------------------------------------
+
+    candidates = []
+
+    if first_hit_5 is not None:
+        candidates.append(
+            (
+                first_hit_5,
+                "HIT_5",
+            )
+        )
+
+    if first_stop_5 is not None:
+        candidates.append(
+            (
+                first_stop_5,
+                "STOP_5",
+            )
+        )
+
+    if candidates:
+
+        candidates.sort(
+            key=lambda x: x[0]
+        )
+
+        if (
+            len(candidates) >= 2
+            and candidates[0][0]
+            == candidates[1][0]
+        ):
+
+            result["first_event"] = (
+                "AMBIGUOUS"
             )
 
-            result[
-                f"hit_{int(target * 100)}"
-            ] = True
-
-            result[
-                f"days_to_{int(target * 100)}"
-            ] = first_position
+            result["first_day"] = (
+                candidates[0][0]
+            )
 
         else:
 
-            result[
-                f"hit_{int(target * 100)}"
-            ] = False
-
-            result[
-                f"days_to_{int(target * 100)}"
-            ] = np.nan
-
-    # --------------------------------------------------------
-    # -5 / -10 선이탈
-    # --------------------------------------------------------
-
-    for stop in [
-        -0.05,
-        -0.10,
-    ]:
-
-        reached = (
-            low_ret <= stop
-        )
-
-        name = str(
-            int(
-                abs(stop)
-                * 100
-            )
-        )
-
-        if reached.any():
-
-            first_position = (
-                int(
-                    np.argmax(
-                        reached.to_numpy()
-                    )
-                )
-                + 1
+            result["first_event"] = (
+                candidates[0][1]
             )
 
-            result[
-                f"hit_down_{name}"
-            ] = True
+            result["first_day"] = (
+                candidates[0][0]
+            )
 
-            result[
-                f"days_to_down_{name}"
-            ] = first_position
+    # --------------------------------------------------------
+    # 선후관계
+    # --------------------------------------------------------
 
-        else:
+    result[
+        "hit_5_before_stop5"
+    ] = before(
+        first_hit_5,
+        first_stop_5,
+    )
 
-            result[
-                f"hit_down_{name}"
-            ] = False
+    result[
+        "hit_10_before_stop5"
+    ] = before(
+        first_hit_10,
+        first_stop_5,
+    )
 
-            result[
-                f"days_to_down_{name}"
-            ] = np.nan
+    result[
+        "hit_20_before_stop5"
+    ] = before(
+        first_hit_20,
+        first_stop_5,
+    )
+
+    result[
+        "stop_5_before_hit5"
+    ] = before(
+        first_stop_5,
+        first_hit_5,
+    )
 
     return result
 
