@@ -3779,7 +3779,7 @@ def analyze_symbol(
                         base_cluster_id,
                 }
             )
-
+            )
 
     if not cycle_clusters:
 
