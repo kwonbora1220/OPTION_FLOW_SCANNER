@@ -1238,11 +1238,20 @@ def extract_events(df):
         ):
             continue
 
+        
         outcome = future_outcome(
             df,
             end,
         )
-        outcome.update(ordered_outcome(df, end_idx, forward=FORWARD))
+
+        outcome.update(
+            ordered_outcome(
+            df,
+            end,
+            forward=FORWARD,
+            )
+        )
+        
         if not outcome:
             continue
 
