@@ -3663,6 +3663,93 @@ def analyze_symbol(
                 continue
 
             cycle_clusters.append(
+                
+              for group in groups:
+
+            if len(
+                group["events"]
+            ) < MIN_DRIVER_OCCURRENCES:
+
+                continue
+
+            # 원래 1차 Pattern Cluster의 centroid를
+            # 2차 Cycle Cluster까지 반드시 전달한다.
+            #
+            # 이후 DRIVER 중복 제거에서
+            #
+            # candidate["cluster"]["centroid"]
+            #
+            # 를 사용하기 때문에 필수다.
+            source_centroid = cluster.get(
+                "centroid"
+            )
+
+            if source_centroid is None:
+
+                signatures = [
+                    event["signature"]
+                    for event
+                    in group["events"]
+                ]
+
+                if signatures:
+
+                    source_centroid = np.mean(
+                        signatures,
+                        axis=0,
+                    )
+
+                    norm = np.linalg.norm(
+                        source_centroid
+                    )
+
+                    if norm > 1e-12:
+
+                        source_centroid = (
+                            source_centroid
+                            / norm
+                        )
+
+                else:
+
+                    source_centroid = np.zeros(
+                        len(
+                            group["events"][0][
+                                "signature"
+                            ]
+                        )
+                    )
+
+            # pattern label
+            labels = [
+                event["label"]
+                for event
+                in group["events"]
+            ]
+
+            modes = pd.Series(
+                labels
+            ).mode()
+
+            pattern = (
+                str(
+                    modes.iloc[0]
+                )
+                if not modes.empty
+                else "구조불명"
+            )
+
+            # BASE cluster ID는
+            # 원래 Pattern Cluster 기준으로 만든다.
+            base_cluster_id = (
+                make_base_cluster_id(
+                    symbol,
+                    pattern,
+                    group["events"],
+                )
+            )
+
+            cycle_clusters.append(
                 {
                     "events":
                         group["events"],
@@ -3684,38 +3771,12 @@ def analyze_symbol(
                             [],
                         ),
 
+                    # ★ 핵심 수정
+                    "centroid":
+                        source_centroid,
+
                     "base_cluster_id":
-                        make_base_cluster_id(
-                            symbol,
-                            str(
-                                pd.Series(
-                                    [
-                                        e[
-                                            "label"
-                                        ]
-                                        for e
-                                        in group[
-                                            "events"
-                                        ]
-                                    ]
-                                ).mode().iloc[0]
-                                if not pd.Series(
-                                    [
-                                        e[
-                                            "label"
-                                        ]
-                                        for e
-                                        in group[
-                                            "events"
-                                        ]
-                                    ]
-                                ).mode().empty
-                                else "구조불명"
-                            ),
-                            group[
-                                "events"
-                            ],
-                        ),
+                        base_cluster_id,
                 }
             )
 
