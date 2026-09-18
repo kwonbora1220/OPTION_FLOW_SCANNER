@@ -1,0 +1,70 @@
+name: DRIVER ENGINE TEST
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  driver-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check driver files
+        run: |
+          echo "===== DRIVER FILE CHECK ====="
+          ls -la
+          echo
+          ls -la 03_RESULTS/daily || true
+          echo
+          test -f driver_engine.py
+          echo "driver_engine.py OK"
+
+      - name: Run Driver Engine
+        run: |
+          echo "===== DRIVER ENGINE START ====="
+          python driver_engine.py
+          echo "===== DRIVER ENGINE END ====="
+
+      - name: Check Driver Outputs
+        run: |
+          echo "===== OUTPUT CHECK ====="
+
+          test -f 03_RESULTS/daily/driver_profile.csv
+          test -f 03_RESULTS/daily/driver_current.csv
+          test -f 03_RESULTS/daily/driver_history.csv
+
+          echo
+          echo "----- driver_profile.csv -----"
+          cat 03_RESULTS/daily/driver_profile.csv
+
+          echo
+          echo "----- driver_current.csv -----"
+          cat 03_RESULTS/daily/driver_current.csv
+
+          echo
+          echo "----- driver_history.csv (first 50 lines) -----"
+          head -n 50 03_RESULTS/daily/driver_history.csv
+
+      - name: Upload Driver Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-test-results
+          path: |
+            03_RESULTS/daily/driver_profile.csv
+            03_RESULTS/daily/driver_current.csv
+            03_RESULTS/daily/driver_history.csv
