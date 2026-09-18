@@ -3,8 +3,45 @@
 # ============================================================
 
 SELECTED_SYMBOLS = [
-    "RKLB",
-    "UBER",
+# ============================================================
+# SELECTED SYMBOLS
+# ============================================================
+
+SELECTED_SYMBOLS = [
+    "DKNG",
+    "NVO",
+    "NVDA",
+    "MRVL",
+    "NBIS",
+    "PL",
+    "BE",
+    "CEG",
+    "VST",
+    "DRAM",
+    "SKHY",
+    "CRDO",
+    "POET",
     "CBRS",
+    "NVTS",
+    "XYZ",
+    "IREN",
+    "OKLO",
+    "ORCL",
+    "RKLB",
+    "FLY",
+    "LUNR",
+    "CRCL",
+    "SPCX",
+    "RUN",
+    "EWY",
+    "REMX",
+    "MSTR",
+    "META",
+    "UBER",
+    "MSFT",
+    "TSLA",
+]
+
+
  
 ]
