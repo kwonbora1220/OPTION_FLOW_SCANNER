@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-UNIVERSAL DRIVER ENGINE v3
+UNIVERSAL DRIVER ENGINE v4
 ==========================
 
 목적
@@ -991,6 +991,106 @@ def choose_pattern_label(window):
 # ============================================================
 # FUTURE OUTCOME ENGINE
 # ============================================================
+
+
+def ordered_outcome(df, end_idx, forward=FORWARD):
+    """
+    v4: measure which threshold is reached first after a driver event.
+    Positive thresholds are evaluated against future HIGH; negative thresholds
+    against future LOW. This prevents +5% and -5% from both being counted as
+    separate 'wins' when both happened in the same forward window.
+    """
+    if end_idx >= len(df) - 1:
+        return {
+            "first_event": "NO_FUTURE",
+            "first_day": np.nan,
+            "hit_5_before_stop5": np.nan,
+            "hit_10_before_stop5": np.nan,
+            "hit_20_before_stop5": np.nan,
+            "stop_5_before_hit5": np.nan,
+        }
+
+    entry = float(df["Close"].iloc[end_idx])
+    if not np.isfinite(entry) or entry <= 0:
+        return {
+            "first_event": "INVALID_ENTRY",
+            "first_day": np.nan,
+            "hit_5_before_stop5": np.nan,
+            "hit_10_before_stop5": np.nan,
+            "hit_20_before_stop5": np.nan,
+            "stop_5_before_hit5": np.nan,
+        }
+
+    stop5 = entry * 0.95
+    hit5 = entry * 1.05
+    hit10 = entry * 1.10
+    hit20 = entry * 1.20
+
+    end = min(len(df), end_idx + 1 + forward)
+    first5 = first10 = first20 = firststop = None
+
+    for j in range(end_idx + 1, end):
+        day = j - end_idx
+        hi = float(df["High"].iloc[j])
+        lo = float(df["Low"].iloc[j])
+
+        # Same-day collisions are conservatively treated as ambiguous.
+        pos = []
+        neg = []
+        if np.isfinite(hi):
+            if hi >= hit5: pos.append(("HIT_5", day))
+            if hi >= hit10: pos.append(("HIT_10", day))
+            if hi >= hit20: pos.append(("HIT_20", day))
+        if np.isfinite(lo) and lo <= stop5:
+            neg.append(("STOP_5", day))
+
+        if first5 is None and pos:
+            first5 = pos[0]
+        if first10 is None and any(x[0] == "HIT_10" for x in pos):
+            first10 = ("HIT_10", day)
+        if first20 is None and any(x[0] == "HIT_20" for x in pos):
+            first20 = ("HIT_20", day)
+        if firststop is None and neg:
+            firststop = neg[0]
+
+        # Determine earliest directional event for this day.
+        if first5 is not None or firststop is not None:
+            break
+
+    def before(a, b):
+        if a is None:
+            return np.nan
+        if b is None:
+            return 1.0
+        # If same day, mark as ambiguous rather than manufacturing a winner.
+        if a[1] == b[1]:
+            return np.nan
+        return 1.0 if a[1] < b[1] else 0.0
+
+    candidates = []
+    if first5:
+        candidates.append(first5)
+    if firststop:
+        candidates.append(firststop)
+
+    first_event = "NONE"
+    first_day = np.nan
+    if candidates:
+        candidates.sort(key=lambda x: x[1])
+        if len(candidates) >= 2 and candidates[0][1] == candidates[1][1]:
+            first_event = "AMBIGUOUS"
+        else:
+            first_event, first_day = candidates[0]
+
+    return {
+        "first_event": first_event,
+        "first_day": first_day,
+        "hit_5_before_stop5": before(first5, firststop),
+        "hit_10_before_stop5": before(first10, firststop),
+        "hit_20_before_stop5": before(first20, firststop),
+        "stop_5_before_hit5": before(firststop, first5),
+    }
+
 
 def future_outcome(
     df,
@@ -2922,7 +3022,7 @@ def run(symbols):
     )
 
     print(
-        " UNIVERSAL DRIVER ENGINE v3"
+        " UNIVERSAL DRIVER ENGINE v4"
     )
 
     print(
