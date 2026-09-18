@@ -1,25 +1,26 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-UNIVERSAL DRIVER ENGINE v6.1
+UNIVERSAL DRIVER ENGINE v6.2
 ============================
 
 종목별 과거 OHLCV에서 반복되는 "운전수(Driver)"를 탐색한다.
 
-핵심
-----
-1. +5% / +10% / +20% 목표가 -5% 손절보다 먼저 도달했는지 계산
-2. 같은 봉에서 target/stop 동시 발생 → AMBIGUOUS
-3. 미래 데이터가 완전히 존재하는 과거 사건만 학습
-4. Pattern Cluster + Cycle Cluster 2단계 구조
-5. Cycle cluster에도 원본 centroid를 반드시 전달
-6. cluster_id와 driver_rank 분리
-7. 반복 횟수 기반 검증
-8. 최근 재현성 계산
-9. cycle 안정성 계산
-10. 기존 CSV 출력 유지
+v6.2 핵심 변경
+--------------
+1. 미래 40일이 완전히 존재하는 역사 이벤트만 학습
+2. Pattern Cluster + Cycle Cluster 구조 유지
+3. Cycle 계산은 "인접 이벤트 간격"을 1차 근거로 사용
+4. 전체 pairwise gap은 보조 검증으로만 사용
+5. 1x / 2x / 3x harmonic cycle 통합
+6. 2개 이벤트만 있는 경우 cycle validation 금지
+7. 서로 다른 cycle을 억지로 별도 driver로 만들지 않음
+8. 서로 다른 구조의 pattern만 별도 driver로 분리
+9. 최근 재현성 계산
+10. cycle stability 계산
+11. validation 단계 강화
+12. 최대 3개지만 실제로 검증되는 driver만 출력
 
 출력
 -----
@@ -47,6 +48,7 @@ OUTPUT_DIR = Path("03_RESULTS/daily")
 PROFILE_FILE = OUTPUT_DIR / "driver_profile.csv"
 CURRENT_FILE = OUTPUT_DIR / "driver_current.csv"
 HISTORY_FILE = OUTPUT_DIR / "driver_history.csv"
+
 
 LOOKBACK_PERIOD = os.getenv(
     "DRIVER_LOOKBACK",
@@ -80,6 +82,7 @@ MAX_DRIVERS = int(
         "3",
     )
 )
+
 
 CURRENT_ACTIVE_SIM = float(
     os.getenv(
@@ -130,10 +133,17 @@ CYCLE_TOLERANCE = float(
     )
 )
 
+HARMONIC_TOLERANCE = float(
+    os.getenv(
+        "DRIVER_HARMONIC_TOLERANCE",
+        "0.25",
+    )
+)
+
 MIN_DRIVER_OCCURRENCES = int(
     os.getenv(
         "DRIVER_MIN_OCCURRENCES",
-        "2",
+        "3",
     )
 )
 
@@ -165,10 +175,32 @@ MIN_CYCLE_STABILITY = float(
     )
 )
 
-HARMONIC_TOLERANCE = float(
+MIN_CYCLE_OBSERVATIONS = int(
     os.getenv(
-        "DRIVER_HARMONIC_TOLERANCE",
-        "0.25",
+        "DRIVER_MIN_CYCLE_OBSERVATIONS",
+        "2",
+    )
+)
+
+MAX_CYCLE_MULTIPLE = int(
+    os.getenv(
+        "DRIVER_MAX_CYCLE_MULTIPLE",
+        "3",
+    )
+)
+
+# 너무 비슷한 두 driver를 중복으로 뽑지 않기 위한 기준
+DUPLICATE_SIM = float(
+    os.getenv(
+        "DRIVER_DUPLICATE_SIM",
+        "0.97",
+    )
+)
+
+DUPLICATE_CYCLE_RATIO = float(
+    os.getenv(
+        "DRIVER_DUPLICATE_CYCLE_RATIO",
+        "1.35",
     )
 )
 
@@ -180,6 +212,7 @@ HARMONIC_TOLERANCE = float(
 def rnd(value, digits=2):
 
     try:
+
         value = float(value)
 
         if not np.isfinite(value):
@@ -194,6 +227,7 @@ def rnd(value, digits=2):
 def pct(value, digits=2):
 
     try:
+
         value = float(value)
 
         if not np.isfinite(value):
@@ -203,27 +237,6 @@ def pct(value, digits=2):
 
     except Exception:
         return np.nan
-
-
-def finite_values(values):
-
-    result = []
-
-    for value in values:
-
-        try:
-            value = float(value)
-
-            if np.isfinite(value):
-                result.append(value)
-
-        except Exception:
-            pass
-
-    return pd.Series(
-        result,
-        dtype=float,
-    )
 
 
 def safe_float(value, default=np.nan):
@@ -239,6 +252,62 @@ def safe_float(value, default=np.nan):
         pass
 
     return default
+
+
+def finite_values(values):
+
+    result = []
+
+    for value in values:
+
+        value = safe_float(value)
+
+        if np.isfinite(value):
+            result.append(value)
+
+    return pd.Series(
+        result,
+        dtype=float,
+    )
+
+
+def safe_mean(values):
+
+    series = finite_values(values)
+
+    if series.empty:
+        return np.nan
+
+    return float(series.mean())
+
+
+def safe_median(values):
+
+    series = finite_values(values)
+
+    if series.empty:
+        return np.nan
+
+    return float(series.median())
+
+
+def safe_std(values):
+
+    series = finite_values(values)
+
+    if len(series) < 2:
+        return np.nan
+
+    return float(series.std(ddof=0))
+
+
+def date_string(value):
+
+    try:
+        return pd.Timestamp(value).date().isoformat()
+
+    except Exception:
+        return str(value)
 
 
 # ============================================================
@@ -272,6 +341,7 @@ def clean_download(df):
                     "Adj Close",
                     "Volume",
                 }:
+
                     found = name
                     break
 
@@ -307,7 +377,9 @@ def clean_download(df):
         elif name == "volume":
             rename[column] = "Volume"
 
-    out = out.rename(columns=rename)
+    out = out.rename(
+        columns=rename
+    )
 
     required = [
         "Open",
@@ -321,6 +393,7 @@ def clean_download(df):
         column not in out.columns
         for column in required
     ):
+
         return pd.DataFrame()
 
     for column in required:
@@ -430,25 +503,37 @@ def add_features(df):
 
     x["ma20_gap"] = (
         close
-        / x["ma20"].replace(0, np.nan)
+        / x["ma20"].replace(
+            0,
+            np.nan,
+        )
         - 1
     )
 
     x["ma50_gap"] = (
         close
-        / x["ma50"].replace(0, np.nan)
+        / x["ma50"].replace(
+            0,
+            np.nan,
+        )
         - 1
     )
 
     x["ma100_gap"] = (
         close
-        / x["ma100"].replace(0, np.nan)
+        / x["ma100"].replace(
+            0,
+            np.nan,
+        )
         - 1
     )
 
     x["ma200_gap"] = (
         close
-        / x["ma200"].replace(0, np.nan)
+        / x["ma200"].replace(
+            0,
+            np.nan,
+        )
         - 1
     )
 
@@ -527,7 +612,10 @@ def robust_zscore(values):
             not np.isfinite(std)
             or std < 1e-9
         ):
-            return np.zeros_like(array)
+
+            return np.zeros_like(
+                array
+            )
 
         filled = np.nan_to_num(
             array,
@@ -535,7 +623,8 @@ def robust_zscore(values):
         )
 
         return (
-            filled - np.mean(finite)
+            filled
+            - np.mean(finite)
         ) / std
 
     filled = np.nan_to_num(
@@ -550,7 +639,10 @@ def robust_zscore(values):
     )
 
 
-def safe_interpolate(values, length):
+def safe_interpolate(
+    values,
+    length,
+):
 
     array = np.asarray(
         values,
@@ -596,7 +688,9 @@ def make_signature(window):
 
     close = window[
         "Close"
-    ].to_numpy(dtype=float)
+    ].to_numpy(
+        dtype=float
+    )
 
     base = (
         close[0]
@@ -623,7 +717,9 @@ def make_signature(window):
     volume_ratio = (
         window["vol_ratio"]
         .fillna(1)
-        .to_numpy(dtype=float)
+        .to_numpy(
+            dtype=float
+        )
     )
 
     volume_ratio = np.clip(
@@ -696,13 +792,34 @@ def make_signature(window):
 
     scalar = np.array(
         [
-            last.get("hh20", 0),
-            last.get("ll20", 0),
-            last.get("hh60", 0),
-            last.get("ll60", 0),
-            last.get("slope20", 0),
-            last.get("slope50", 0),
-            last.get("atr_pct", 0),
+            last.get(
+                "hh20",
+                0,
+            ),
+            last.get(
+                "ll20",
+                0,
+            ),
+            last.get(
+                "hh60",
+                0,
+            ),
+            last.get(
+                "ll60",
+                0,
+            ),
+            last.get(
+                "slope20",
+                0,
+            ),
+            last.get(
+                "slope50",
+                0,
+            ),
+            last.get(
+                "atr_pct",
+                0,
+            ),
         ],
         dtype=float,
     )
@@ -711,7 +828,9 @@ def make_signature(window):
         [
             price_part,
             volume_part,
-            np.asarray(ma_parts),
+            np.asarray(
+                ma_parts
+            ),
             volatility_part,
             scalar,
         ]
@@ -733,12 +852,19 @@ def make_signature(window):
     )
 
     if norm < 1e-12:
-        return np.zeros_like(signature)
+        return np.zeros_like(
+            signature
+        )
 
-    return signature / norm
+    return (
+        signature / norm
+    )
 
 
-def cosine_similarity(a, b):
+def cosine_similarity(
+    a,
+    b,
+):
 
     if len(a) != len(b):
         return 0.0
@@ -750,11 +876,15 @@ def cosine_similarity(a, b):
         norm_a < 1e-12
         or norm_b < 1e-12
     ):
+
         return 0.0
 
     similarity = (
         np.dot(a, b)
-        / (norm_a * norm_b)
+        / (
+            norm_a
+            * norm_b
+        )
     )
 
     return float(
@@ -767,28 +897,46 @@ def cosine_similarity(a, b):
 
 
 # ============================================================
-# HUMAN PATTERN
+# PATTERN LABEL
 # ============================================================
 
-def choose_pattern_label(window):
+def choose_pattern_label(
+    window,
+):
 
     close = window["Close"]
 
-    start = float(close.iloc[0])
-    end = float(close.iloc[-1])
+    start = safe_float(
+        close.iloc[0]
+    )
 
-    if start <= 0:
+    end = safe_float(
+        close.iloc[-1]
+    )
+
+    if (
+        not np.isfinite(start)
+        or start <= 0
+    ):
+
         return "구조불명"
 
-    total = end / start - 1
+    total = (
+        end / start - 1
+    )
 
     half = max(
         len(close) // 2,
         1,
     )
 
-    first = close.iloc[:half]
-    second = close.iloc[half:]
+    first = close.iloc[
+        :half
+    ]
+
+    second = close.iloc[
+        half:
+    ]
 
     first_move = (
         first.iloc[-1]
@@ -802,29 +950,53 @@ def choose_pattern_label(window):
         - 1
     )
 
-    peak = float(close.max())
-    trough = float(close.min())
+    peak = float(
+        close.max()
+    )
 
-    peak_pos = int(close.argmax())
-    trough_pos = int(close.argmin())
+    trough = float(
+        close.min()
+    )
 
-    peak_return = peak / start - 1
-    trough_return = trough / start - 1
+    peak_pos = int(
+        close.argmax()
+    )
+
+    trough_pos = int(
+        close.argmin()
+    )
+
+    peak_return = (
+        peak / start - 1
+    )
+
+    trough_return = (
+        trough / start - 1
+    )
 
     last = window.iloc[-1]
 
     ma20_gap = safe_float(
-        last.get("ma20_gap", 0),
+        last.get(
+            "ma20_gap",
+            0,
+        ),
         0,
     )
 
     ma50_gap = safe_float(
-        last.get("ma50_gap", 0),
+        last.get(
+            "ma50_gap",
+            0,
+        ),
         0,
     )
 
     slope20 = safe_float(
-        last.get("slope20", 0),
+        last.get(
+            "slope20",
+            0,
+        ),
         0,
     )
 
@@ -838,26 +1010,37 @@ def choose_pattern_label(window):
 
     if (
         trough_return <= -0.18
-        and trough_pos < len(close) * 0.80
+        and trough_pos
+        < len(close) * 0.80
         and total > -0.10
     ):
-        return "급락→저점형성→회복"
+
+        return (
+            "급락→저점형성→회복"
+        )
 
     if (
         peak_return >= 0.20
         and trough_pos > peak_pos
         and second_move > 0.05
     ):
-        return "급등→조정→재상승"
+
+        return (
+            "급등→조정→재상승"
+        )
 
     if (
         np.isfinite(current_vol)
         and np.isfinite(median_vol)
         and median_vol > 0
-        and current_vol > median_vol * 1.15
+        and current_vol
+        > median_vol * 1.15
         and total > 0.10
     ):
-        return "압축→돌파→확장"
+
+        return (
+            "압축→돌파→확장"
+        )
 
     if (
         total > 0.12
@@ -865,7 +1048,10 @@ def choose_pattern_label(window):
         and ma50_gap > -0.02
         and slope20 > 0
     ):
-        return "추세상승→확장"
+
+        return (
+            "추세상승→확장"
+        )
 
     if (
         total < -0.12
@@ -873,10 +1059,16 @@ def choose_pattern_label(window):
         and ma50_gap < 0
         and slope20 < 0
     ):
-        return "추세하락→반등시도"
+
+        return (
+            "추세하락→반등시도"
+        )
 
     if abs(total) < 0.10:
-        return "박스→반복회귀"
+
+        return (
+            "박스→반복회귀"
+        )
 
     return "추세전환형"
 
@@ -888,17 +1080,38 @@ def choose_pattern_label(window):
 def empty_ordered_outcome():
 
     return {
-        "first_event": "NO_FUTURE",
-        "first_day": np.nan,
-        "plus5_first": np.nan,
-        "plus10_first": np.nan,
-        "plus20_first": np.nan,
-        "minus5_first": np.nan,
-        "days_to_plus5": np.nan,
-        "days_to_plus10": np.nan,
-        "days_to_plus20": np.nan,
-        "days_to_minus5": np.nan,
-        "outcome_status": "NO_FUTURE",
+        "first_event":
+            "NO_FUTURE",
+
+        "first_day":
+            np.nan,
+
+        "plus5_first":
+            np.nan,
+
+        "plus10_first":
+            np.nan,
+
+        "plus20_first":
+            np.nan,
+
+        "minus5_first":
+            np.nan,
+
+        "days_to_plus5":
+            np.nan,
+
+        "days_to_plus10":
+            np.nan,
+
+        "days_to_plus20":
+            np.nan,
+
+        "days_to_minus5":
+            np.nan,
+
+        "outcome_status":
+            "NO_FUTURE",
     }
 
 
@@ -909,6 +1122,7 @@ def ordered_outcome(
 ):
 
     if end_idx >= len(df) - 1:
+
         return empty_ordered_outcome()
 
     entry = safe_float(
@@ -919,13 +1133,24 @@ def ordered_outcome(
         not np.isfinite(entry)
         or entry <= 0
     ):
+
         return empty_ordered_outcome()
 
-    target5 = entry * 1.05
-    target10 = entry * 1.10
-    target20 = entry * 1.20
+    target5 = (
+        entry * 1.05
+    )
 
-    stop5 = entry * 0.95
+    target10 = (
+        entry * 1.10
+    )
+
+    target20 = (
+        entry * 1.20
+    )
+
+    stop5 = (
+        entry * 0.95
+    )
 
     end = min(
         len(df),
@@ -957,6 +1182,7 @@ def ordered_outcome(
             and np.isfinite(high)
             and high >= target5
         ):
+
             first_plus5 = day
 
         if (
@@ -964,6 +1190,7 @@ def ordered_outcome(
             and np.isfinite(high)
             and high >= target10
         ):
+
             first_plus10 = day
 
         if (
@@ -971,6 +1198,7 @@ def ordered_outcome(
             and np.isfinite(high)
             and high >= target20
         ):
+
             first_plus20 = day
 
         if (
@@ -978,12 +1206,14 @@ def ordered_outcome(
             and np.isfinite(low)
             and low <= stop5
         ):
+
             first_minus5 = day
 
         if (
             first_plus20 is not None
             and first_minus5 is not None
         ):
+
             break
 
     def positive_first(
@@ -1027,13 +1257,21 @@ def ordered_outcome(
     candidates = []
 
     if first_plus5 is not None:
+
         candidates.append(
-            ("PLUS_5", first_plus5)
+            (
+                "PLUS_5",
+                first_plus5,
+            )
         )
 
     if first_minus5 is not None:
+
         candidates.append(
-            ("MINUS_5", first_minus5)
+            (
+                "MINUS_5",
+                first_minus5,
+            )
         )
 
     if candidates:
@@ -1048,13 +1286,23 @@ def ordered_outcome(
             == candidates[1][1]
         ):
 
-            first_event = "AMBIGUOUS"
-            first_day = candidates[0][1]
+            first_event = (
+                "AMBIGUOUS"
+            )
+
+            first_day = (
+                candidates[0][1]
+            )
 
         else:
 
-            first_event = candidates[0][0]
-            first_day = candidates[0][1]
+            first_event = (
+                candidates[0][0]
+            )
+
+            first_day = (
+                candidates[0][1]
+            )
 
     else:
 
@@ -1063,22 +1311,32 @@ def ordered_outcome(
 
     if first_event == "AMBIGUOUS":
 
-        outcome_status = "AMBIGUOUS"
+        outcome_status = (
+            "AMBIGUOUS"
+        )
 
     elif first_event in {
         "PLUS_5",
         "MINUS_5",
     }:
 
-        outcome_status = "RESOLVED"
+        outcome_status = (
+            "RESOLVED"
+        )
 
     else:
 
-        outcome_status = "NO_HIT"
+        outcome_status = (
+            "NO_HIT"
+        )
 
     return {
-        "first_event": first_event,
-        "first_day": first_day,
+
+        "first_event":
+            first_event,
+
+        "first_day":
+            first_day,
 
         "plus5_first":
             positive_first(
@@ -1154,6 +1412,7 @@ def future_summary(
         not np.isfinite(entry)
         or entry <= 0
     ):
+
         return {}
 
     future = df.iloc[
@@ -1192,6 +1451,7 @@ def future_summary(
     )
 
     return {
+
         "forward_return":
             safe_float(
                 close_ret.iloc[-1]
@@ -1207,17 +1467,791 @@ def future_summary(
                 low_ret.min()
             ),
 
-        **ordered,
+        "ordered":
+            ordered,
     }
+
+
+# ============================================================
+# CYCLE ENGINE v6.2
+# ============================================================
+
+def adjacent_gaps(events):
+
+    if len(events) < 2:
+        return []
+
+    ordered = sorted(
+        events,
+        key=lambda e: pd.Timestamp(
+            e["date"]
+        ),
+    )
+
+    gaps = []
+
+    for previous, current in zip(
+        ordered[:-1],
+        ordered[1:],
+    ):
+
+        gap = (
+            pd.Timestamp(
+                current["date"]
+            )
+            - pd.Timestamp(
+                previous["date"]
+            )
+        ).days
+
+        if gap >= CYCLE_MIN_DAYS:
+
+            gaps.append(
+                {
+                    "gap": float(gap),
+                    "from_date":
+                        previous["date"],
+                    "to_date":
+                        current["date"],
+                }
+            )
+
+    return gaps
+
+
+def pairwise_gaps(events):
+
+    if len(events) < 2:
+        return []
+
+    ordered = sorted(
+        events,
+        key=lambda e: pd.Timestamp(
+            e["date"]
+        ),
+    )
+
+    gaps = []
+
+    for i in range(
+        len(ordered)
+    ):
+
+        for j in range(
+            i + 1,
+            len(ordered)
+        ):
+
+            gap = (
+                pd.Timestamp(
+                    ordered[j]["date"]
+                )
+                - pd.Timestamp(
+                    ordered[i]["date"]
+                )
+            ).days
+
+            if gap >= CYCLE_MIN_DAYS:
+
+                gaps.append(
+                    float(gap)
+                )
+
+    return gaps
+
+
+def harmonic_ratio(
+    gap,
+    base,
+):
+
+    if (
+        not np.isfinite(gap)
+        or not np.isfinite(base)
+        or base <= 0
+    ):
+
+        return np.nan
+
+    ratio = gap / base
+
+    nearest = max(
+        1,
+        min(
+            MAX_CYCLE_MULTIPLE,
+            int(
+                round(ratio)
+            ),
+        ),
+    )
+
+    return ratio / nearest
+
+
+def fits_harmonic(
+    gap,
+    base,
+    tolerance=HARMONIC_TOLERANCE,
+):
+
+    if (
+        not np.isfinite(gap)
+        or not np.isfinite(base)
+        or base <= 0
+    ):
+
+        return False
+
+    ratio = gap / base
+
+    nearest = int(
+        round(ratio)
+    )
+
+    if nearest < 1:
+        return False
+
+    if nearest > MAX_CYCLE_MULTIPLE:
+        return False
+
+    relative_error = abs(
+        ratio - nearest
+    ) / nearest
+
+    return (
+        relative_error
+        <= tolerance
+    )
+
+
+def candidate_cycle_bases(
+    gaps
+):
+
+    values = sorted(
+        set(
+            int(round(gap))
+            for gap in gaps
+            if (
+                np.isfinite(gap)
+                and gap >= CYCLE_MIN_DAYS
+            )
+        )
+    )
+
+    candidates = set()
+
+    for gap in values:
+
+        candidates.add(
+            float(gap)
+        )
+
+        for multiple in range(
+            2,
+            MAX_CYCLE_MULTIPLE + 1,
+        ):
+
+            base = gap / multiple
+
+            if base >= CYCLE_MIN_DAYS:
+
+                candidates.add(
+                    round(
+                        base,
+                        2,
+                    )
+                )
+
+    return sorted(
+        candidates
+    )
+
+
+def cycle_fit_score(
+    base,
+    adjacent,
+    pairwise,
+):
+
+    if not adjacent:
+        return None
+
+    adjacent_values = [
+        float(item["gap"])
+        for item in adjacent
+    ]
+
+    adjacent_fit = [
+        gap
+        for gap in adjacent_values
+        if fits_harmonic(
+            gap,
+            base,
+        )
+    ]
+
+    pairwise_fit = [
+        gap
+        for gap in pairwise
+        if fits_harmonic(
+            gap,
+            base,
+        )
+    ]
+
+    adjacent_support = len(
+        adjacent_fit
+    )
+
+    pairwise_support = len(
+        pairwise_fit
+    )
+
+    # 인접 gap이 핵심.
+    # pairwise는 보조점수.
+    score = (
+        adjacent_support * 10
+        + pairwise_support * 0.25
+    )
+
+    return {
+        "base": float(base),
+        "adjacent_support":
+            adjacent_support,
+        "pairwise_support":
+            pairwise_support,
+        "adjacent_values":
+            adjacent_values,
+        "adjacent_fit":
+            adjacent_fit,
+        "pairwise_fit":
+            pairwise_fit,
+        "score":
+            float(score),
+    }
+
+
+def select_cycle_base(
+    events
+):
+
+    adjacent = adjacent_gaps(
+        events
+    )
+
+    if len(adjacent) < 1:
+
+        return {
+            "valid": False,
+            "reason":
+                "NO_ADJACENT_GAP",
+            "base": np.nan,
+            "observations": 0,
+            "stability": np.nan,
+            "adjacent": [],
+            "pairwise": [],
+        }
+
+    pairwise = pairwise_gaps(
+        events
+    )
+
+    gaps = [
+        item["gap"]
+        for item in adjacent
+    ]
+
+    candidates = candidate_cycle_bases(
+        gaps
+    )
+
+    if not candidates:
+
+        return {
+            "valid": False,
+            "reason":
+                "NO_CYCLE_BASE",
+            "base": np.nan,
+            "observations": 0,
+            "stability": np.nan,
+            "adjacent": adjacent,
+            "pairwise": pairwise,
+        }
+
+    fits = []
+
+    for base in candidates:
+
+        result = cycle_fit_score(
+            base,
+            adjacent,
+            pairwise,
+        )
+
+        if result is not None:
+
+            fits.append(
+                result
+            )
+
+    if not fits:
+
+        return {
+            "valid": False,
+            "reason":
+                "NO_CYCLE_FIT",
+            "base": np.nan,
+            "observations": 0,
+            "stability": np.nan,
+            "adjacent": adjacent,
+            "pairwise": pairwise,
+        }
+
+    # --------------------------------------------------------
+    # 우선순위
+    #
+    # 1. 인접 support
+    # 2. 평균 오차가 작은 base
+    # 3. base가 지나치게 작은 harmonic을 선택하지 않도록
+    # --------------------------------------------------------
+
+    def fit_error(item):
+
+        base = item["base"]
+
+        errors = []
+
+        for gap in item[
+            "adjacent_values"
+        ]:
+
+            if fits_harmonic(
+                gap,
+                base,
+            ):
+
+                ratio = (
+                    gap / base
+                )
+
+                nearest = max(
+                    1,
+                    min(
+                        MAX_CYCLE_MULTIPLE,
+                        int(
+                            round(ratio)
+                        ),
+                    ),
+                )
+
+                errors.append(
+                    abs(
+                        ratio
+                        - nearest
+                    )
+                    / nearest
+                )
+
+        if not errors:
+            return 999.0
+
+        return float(
+            np.mean(errors)
+        )
+
+    fits.sort(
+        key=lambda item: (
+            -item[
+                "adjacent_support"
+            ],
+            fit_error(item),
+            -item[
+                "pairwise_support"
+            ],
+            item["base"],
+        )
+    )
+
+    best = fits[0]
+
+    observations = (
+        best["adjacent_support"]
+    )
+
+    # --------------------------------------------------------
+    # cycle stability
+    # --------------------------------------------------------
+
+    matched = []
+
+    for gap in best[
+        "adjacent_values"
+    ]:
+
+        if fits_harmonic(
+            gap,
+            best["base"],
+        ):
+
+            ratio = gap / best["base"]
+
+            multiple = max(
+                1,
+                min(
+                    MAX_CYCLE_MULTIPLE,
+                    int(
+                        round(ratio)
+                    ),
+                ),
+            )
+
+            normalized_gap = (
+                gap / multiple
+            )
+
+            matched.append(
+                normalized_gap
+            )
+
+    if len(matched) >= 2:
+
+        median_cycle = float(
+            np.median(matched)
+        )
+
+        deviations = [
+            abs(
+                value
+                - median_cycle
+            )
+            / max(
+                median_cycle,
+                1,
+            )
+            for value in matched
+        ]
+
+        mean_deviation = float(
+            np.mean(
+                deviations
+            )
+        )
+
+        stability = max(
+            0.0,
+            1.0
+            - mean_deviation
+        )
+
+    elif len(matched) == 1:
+
+        median_cycle = float(
+            matched[0]
+        )
+
+        stability = 1.0
+
+    else:
+
+        median_cycle = (
+            best["base"]
+        )
+
+        stability = 0.0
+
+    valid = (
+        observations
+        >= MIN_CYCLE_OBSERVATIONS
+    )
+
+    return {
+
+        "valid":
+            valid,
+
+        "reason":
+            (
+                "VALID"
+                if valid
+                else
+                "INSUFFICIENT_RECURRENCE"
+            ),
+
+        "base":
+            float(
+                median_cycle
+            ),
+
+        "observations":
+            int(observations),
+
+        "stability":
+            float(stability),
+
+        "mean":
+            safe_mean(matched),
+
+        "std":
+            safe_std(matched),
+
+        "adjacent":
+            adjacent,
+
+        "pairwise":
+            pairwise,
+
+        "matched":
+            matched,
+    }
+
+
+def classify_cycle(
+    cycle_result
+):
+
+    base = safe_float(
+        cycle_result.get(
+            "base"
+        )
+    )
+
+    if (
+        not np.isfinite(base)
+        or base <= 0
+    ):
+
+        return "미검증"
+
+    if base < 180:
+        return "단기"
+
+    return "장기"
+
+
+def cycle_group_events(
+    events,
+    cycle_result,
+):
+
+    if not events:
+        return []
+
+    base = safe_float(
+        cycle_result.get(
+            "base"
+        )
+    )
+
+    if (
+        not np.isfinite(base)
+        or base <= 0
+    ):
+
+        return list(events)
+
+    ordered = sorted(
+        events,
+        key=lambda e: pd.Timestamp(
+            e["date"]
+        ),
+    )
+
+    # --------------------------------------------------------
+    # 인접 gap을 기준으로 같은 cycle sequence를 연결한다.
+    # harmonic 1x/2x/3x 모두 같은 운전수로 인정.
+    # --------------------------------------------------------
+
+    groups = []
+
+    current = [
+        ordered[0]
+    ]
+
+    for event in ordered[1:]:
+
+        previous = current[-1]
+
+        gap = (
+            pd.Timestamp(
+                event["date"]
+            )
+            - pd.Timestamp(
+                previous["date"]
+            )
+        ).days
+
+        if fits_harmonic(
+            gap,
+            base,
+        ):
+
+            current.append(
+                event
+            )
+
+        else:
+
+            if len(current) >= 2:
+
+                groups.append(
+                    current
+                )
+
+            current = [
+                event
+            ]
+
+    if len(current) >= 2:
+
+        groups.append(
+            current
+        )
+
+    # 연결된 sequence가 없으면
+    # 전체 events를 하나의 그룹으로 유지.
+    if not groups:
+
+        return [
+            ordered
+        ]
+
+    # groups 사이에 실제로 중복 event가 없는지 확인.
+    result = []
+
+    seen = set()
+
+    for group in groups:
+
+        clean_group = []
+
+        for event in group:
+
+            key = str(
+                event["date"]
+            )
+
+            if key not in seen:
+
+                clean_group.append(
+                    event
+                )
+
+                seen.add(key)
+
+        if clean_group:
+
+            result.append(
+                clean_group
+            )
+
+    return result
 
 
 # ============================================================
 # EVENT EXTRACTION
 # ============================================================
 
+def build_event(
+    df,
+    end_idx,
+):
+
+    start_idx = (
+        end_idx
+        - WINDOW
+        + 1
+    )
+
+    if start_idx < 0:
+        return None
+
+    window = df.iloc[
+        start_idx:
+        end_idx + 1
+    ]
+
+    if len(window) < WINDOW:
+        return None
+
+    signature = make_signature(
+        window
+    )
+
+    pattern = choose_pattern_label(
+        window
+    )
+
+    future = future_summary(
+        df,
+        end_idx,
+    )
+
+    if not future:
+        return None
+
+    date = df.index[
+        end_idx
+    ]
+
+    close = safe_float(
+        df["Close"].iloc[end_idx]
+    )
+
+    if (
+        not np.isfinite(close)
+        or close <= 0
+    ):
+
+        return None
+
+    return {
+
+        "date":
+            date,
+
+        "end_idx":
+            int(end_idx),
+
+        "price":
+            close,
+
+        "pattern":
+            pattern,
+
+        "signature":
+            signature,
+
+        "forward_return":
+            future[
+                "forward_return"
+            ],
+
+        "max_up":
+            future[
+                "max_up"
+            ],
+
+        "max_down":
+            future[
+                "max_down"
+            ],
+
+        "ordered":
+            future[
+                "ordered"
+            ],
+    }
+
+
 def extract_events(df):
 
     events = []
+
+    # --------------------------------------------------------
+    # 중요:
+    # 마지막 FORWARD일은 완전한 outcome이 없으므로 제외.
+    # --------------------------------------------------------
 
     first_end = max(
         WINDOW,
@@ -1225,815 +2259,191 @@ def extract_events(df):
     )
 
     last_end = (
-        len(df) - 1 - FORWARD
+        len(df)
+        - 1
+        - FORWARD
     )
 
     if last_end <= first_end:
-        return events
+        return []
+
+    last_event_idx = None
 
     for end_idx in range(
         first_end,
         last_end + 1,
     ):
 
-        window = df.iloc[
-            end_idx - WINDOW + 1:
-            end_idx + 1
-        ].copy()
-
-        if len(window) < WINDOW:
-            continue
-
-        signature = make_signature(
-            window
-        )
-
-        if (
-            signature.size == 0
-            or not np.isfinite(signature).all()
-        ):
-            continue
-
-        outcome = future_summary(
+        event = build_event(
             df,
             end_idx,
         )
 
-        if not outcome:
+        if event is None:
+            continue
+
+        # ----------------------------------------------------
+        # 너무 가까운 이벤트를 제거.
+        # 같은 상승/하락 한 구간을 여러 번 세지 않음.
+        # ----------------------------------------------------
+
+        if (
+            last_event_idx is not None
+            and (
+                end_idx
+                - last_event_idx
+                < EVENT_SPACING
+            )
+        ):
+
+            # 현재 event가 이전보다
+            # 더 현재에 가까운 event이므로
+            # 기본적으로 이전 event 유지.
             continue
 
         events.append(
-            {
-                "end_idx": end_idx,
-                "date": df.index[end_idx],
-                "signature": signature,
-                "label": choose_pattern_label(window),
-                **outcome,
-            }
+            event
         )
 
-    selected = []
+        last_event_idx = (
+            end_idx
+        )
 
-    last_selected_idx = -10**9
-
-    for event in events:
-
-        if (
-            event["end_idx"]
-            - last_selected_idx
-            >= EVENT_SPACING
-        ):
-
-            selected.append(event)
-
-            last_selected_idx = (
-                event["end_idx"]
-            )
-
-    return selected
+    return events
 
 
 # ============================================================
-# SIGNATURE CLUSTERING
+# PATTERN CLUSTER
 # ============================================================
 
-def cluster_patterns(
-    events,
-    threshold,
+def cluster_events(
+    events
 ):
+
+    if not events:
+        return []
 
     clusters = []
 
     for event in events:
 
-        signature = event["signature"]
-
-        best_idx = None
+        best_cluster = None
         best_similarity = -1.0
 
-        for idx, cluster in enumerate(clusters):
+        for cluster in clusters:
+
+            if (
+                event["pattern"]
+                != cluster["pattern"]
+            ):
+
+                continue
 
             similarity = cosine_similarity(
-                signature,
+                event["signature"],
                 cluster["centroid"],
             )
 
-            if similarity > best_similarity:
+            if (
+                similarity
+                >= CLUSTER_SIM
+                and similarity
+                > best_similarity
+            ):
 
-                best_similarity = similarity
-                best_idx = idx
+                best_cluster = cluster
+                best_similarity = (
+                    similarity
+                )
 
-        if (
-            best_idx is not None
-            and best_similarity >= threshold
-        ):
-
-            cluster = clusters[best_idx]
-
-            cluster["events"].append(event)
-
-            centroid = np.mean(
-                [
-                    item["signature"]
-                    for item in cluster["events"]
-                ],
-                axis=0,
-            )
-
-            norm = np.linalg.norm(centroid)
-
-            if norm > 1e-12:
-                centroid = centroid / norm
-
-            cluster["centroid"] = centroid
-
-        else:
+        if best_cluster is None:
 
             clusters.append(
                 {
-                    "centroid":
-                        signature.copy(),
+                    "pattern":
+                        event[
+                            "pattern"
+                        ],
 
                     "events":
                         [event],
+
+                    "centroid":
+                        event[
+                            "signature"
+                        ].copy(),
                 }
             )
+
+        else:
+
+            best_cluster[
+                "events"
+            ].append(
+                event
+            )
+
+            signatures = [
+                item["signature"]
+                for item
+                in best_cluster[
+                    "events"
+                ]
+            ]
+
+            centroid = np.mean(
+                signatures,
+                axis=0,
+            )
+
+            norm = np.linalg.norm(
+                centroid
+            )
+
+            if norm > 1e-12:
+
+                centroid = (
+                    centroid
+                    / norm
+                )
+
+            best_cluster[
+                "centroid"
+            ] = centroid
 
     return clusters
 
 
 # ============================================================
-# CYCLE PAIRS
-# ============================================================
-
-def cycle_pairs(events):
-
-    ordered = sorted(
-        events,
-        key=lambda x: pd.Timestamp(x["date"]),
-    )
-
-    pairs = []
-
-    for i in range(len(ordered)):
-
-        date_i = pd.Timestamp(
-            ordered[i]["date"]
-        )
-
-        for j in range(
-            i + 1,
-            len(ordered),
-        ):
-
-            date_j = pd.Timestamp(
-                ordered[j]["date"]
-            )
-
-            gap = (
-                date_j - date_i
-            ).days
-
-            if gap < CYCLE_MIN_DAYS:
-                continue
-
-            pairs.append(
-                {
-                    "left": ordered[i],
-                    "right": ordered[j],
-                    "gap": gap,
-                }
-            )
-
-    return pairs
-
-
-# ============================================================
-# 1D LOG KMEANS
-# ============================================================
-
-def one_dimensional_kmeans(values):
-
-    values = np.asarray(
-        values,
-        dtype=float,
-    )
-
-    values = values[
-        np.isfinite(values)
-        & (
-            values >= CYCLE_MIN_DAYS
-        )
-    ]
-
-    if len(values) < 4:
-        return None
-
-    logs = np.log(values)
-
-    c1 = float(np.min(logs))
-    c2 = float(np.max(logs))
-
-    if abs(c2 - c1) < 0.10:
-        return None
-
-    for _ in range(50):
-
-        d1 = np.abs(logs - c1)
-        d2 = np.abs(logs - c2)
-
-        group1 = logs[d1 <= d2]
-        group2 = logs[d2 < d1]
-
-        if (
-            len(group1) == 0
-            or len(group2) == 0
-        ):
-            return None
-
-        new_c1 = float(np.mean(group1))
-        new_c2 = float(np.mean(group2))
-
-        if (
-            abs(new_c1 - c1) < 1e-6
-            and abs(new_c2 - c2) < 1e-6
-        ):
-            break
-
-        c1 = new_c1
-        c2 = new_c2
-
-    return sorted(
-        [
-            np.exp(c1),
-            np.exp(c2),
-        ]
-    )
-
-
-# ============================================================
-# CYCLE TYPE
-# ============================================================
-
-def cycle_type_from_days(days):
-
-    days = safe_float(days)
-
-    if not np.isfinite(days):
-        return "단기"
-
-    return (
-        "단기"
-        if days < 180
-        else "장기"
-    )
-
-
-# ============================================================
-# HARMONIC CHECK
-# ============================================================
-
-def harmonic_distance(
-    gap,
-    base,
-):
-
-    gap = safe_float(gap)
-    base = safe_float(base)
-
-    if (
-        not np.isfinite(gap)
-        or not np.isfinite(base)
-        or gap <= 0
-        or base <= 0
-    ):
-        return np.inf
-
-    best = np.inf
-
-    for multiplier in [1, 2, 3]:
-
-        expected = (
-            base * multiplier
-        )
-
-        distance = (
-            abs(gap - expected)
-            / expected
-        )
-
-        best = min(
-            best,
-            distance,
-        )
-
-    return best
-
-
-# ============================================================
-# CYCLE GROUP BUILDER
-# ============================================================
-
-def build_cycle_group(
-    events,
-    mode,
-    cycle_type,
-):
-
-    mode = safe_float(mode)
-
-    if (
-        not np.isfinite(mode)
-        or mode <= 0
-    ):
-        return None
-
-    pairs = cycle_pairs(events)
-
-    matched_pairs = []
-
-    for pair in pairs:
-
-        gap = pair["gap"]
-
-        ratio_distance = (
-            harmonic_distance(
-                gap,
-                mode,
-            )
-        )
-
-        direct_distance = (
-            abs(gap - mode)
-            / mode
-        )
-
-        if (
-            direct_distance <= CYCLE_TOLERANCE
-            or ratio_distance <= HARMONIC_TOLERANCE
-        ):
-
-            matched_pairs.append(pair)
-
-    if not matched_pairs:
-        return None
-
-    event_ids = set()
-
-    for pair in matched_pairs:
-
-        event_ids.add(
-            id(pair["left"])
-        )
-
-        event_ids.add(
-            id(pair["right"])
-        )
-
-    group_events = [
-        event
-        for event in events
-        if id(event) in event_ids
-    ]
-
-    if len(group_events) < 2:
-        return None
-
-    direct_gaps = []
-
-    for pair in matched_pairs:
-
-        gap = pair["gap"]
-
-        if (
-            abs(gap - mode)
-            / mode
-            <= CYCLE_TOLERANCE
-        ):
-
-            direct_gaps.append(gap)
-
-    if direct_gaps:
-
-        actual_mode = float(
-            np.median(direct_gaps)
-        )
-
-    else:
-
-        actual_mode = float(mode)
-
-    return {
-        "events":
-            group_events,
-
-        "cycle_type":
-            cycle_type,
-
-        "cycle_mode":
-            actual_mode,
-
-        "cycle_observations":
-            len(matched_pairs),
-
-        "cycle_pairs":
-            matched_pairs,
-    }
-
-
-# ============================================================
-# CYCLE GROUPS
-# ============================================================
-
-def cycle_groups(events):
-
-    if len(events) < 2:
-
-        return [
-            {
-                "events": list(events),
-                "cycle_type": "단기",
-                "cycle_mode": np.nan,
-                "cycle_observations": 0,
-                "cycle_pairs": [],
-            }
-        ]
-
-    pairs = cycle_pairs(events)
-
-    if not pairs:
-
-        return [
-            {
-                "events": list(events),
-                "cycle_type": "단기",
-                "cycle_mode": np.nan,
-                "cycle_observations": 0,
-                "cycle_pairs": [],
-            }
-        ]
-
-    gaps = np.array(
-        [
-            pair["gap"]
-            for pair in pairs
-        ],
-        dtype=float,
-    )
-
-    gaps = gaps[
-        np.isfinite(gaps)
-    ]
-
-    if len(gaps) == 0:
-        return []
-
-    single_mode = float(
-        np.median(gaps)
-    )
-
-    centers = None
-
-    if (
-        len(gaps) >= 4
-        and gaps.max()
-        / max(gaps.min(), 1)
-        >= CYCLE_SPLIT_RATIO
-    ):
-
-        centers = one_dimensional_kmeans(
-            gaps
-        )
-
-    if (
-        centers is not None
-        and len(centers) == 2
-    ):
-
-        short_mode = centers[0]
-        long_mode = centers[1]
-
-        groups = []
-
-        short_group = build_cycle_group(
-            events,
-            short_mode,
-            "단기",
-        )
-
-        long_group = build_cycle_group(
-            events,
-            long_mode,
-            "장기",
-        )
-
-        if short_group is not None:
-            groups.append(short_group)
-
-        if long_group is not None:
-            groups.append(long_group)
-
-        if len(groups) == 2:
-
-            a = safe_float(
-                groups[0]["cycle_mode"]
-            )
-
-            b = safe_float(
-                groups[1]["cycle_mode"]
-            )
-
-            if (
-                np.isfinite(a)
-                and np.isfinite(b)
-                and max(a, b)
-                / max(min(a, b), 1)
-                < CYCLE_SPLIT_RATIO
-            ):
-
-                groups = [
-                    {
-                        "events":
-                            list(events),
-
-                        "cycle_type":
-                            cycle_type_from_days(
-                                np.median(gaps)
-                            ),
-
-                        "cycle_mode":
-                            float(
-                                np.median(gaps)
-                            ),
-
-                        "cycle_observations":
-                            len(gaps),
-
-                        "cycle_pairs":
-                            pairs,
-                    }
-                ]
-
-        if groups:
-            return groups
-
-    cycle_type = cycle_type_from_days(
-        single_mode
-    )
-
-    group = build_cycle_group(
-        events,
-        single_mode,
-        cycle_type,
-    )
-
-    if group is not None:
-        return [group]
-
-    return [
-        {
-            "events": list(events),
-            "cycle_type": cycle_type,
-            "cycle_mode": single_mode,
-            "cycle_observations": len(gaps),
-            "cycle_pairs": pairs,
-        }
-    ]
-
-
-# ============================================================
-# CYCLE STATISTICS
-# ============================================================
-
-def cycle_statistics(
-    events,
-    cycle_mode=np.nan,
-):
-
-    if len(events) < 2:
-
-        return (
-            np.nan,
-            np.nan,
-            np.nan,
-            0,
-            np.nan,
-        )
-
-    dates = sorted(
-        pd.Timestamp(
-            event["date"]
-        )
-        for event in events
-    )
-
-    gaps = []
-
-    for previous, current in zip(
-        dates[:-1],
-        dates[1:],
-    ):
-
-        gap = (
-            current - previous
-        ).days
-
-        if gap < CYCLE_MIN_DAYS:
-            continue
-
-        mode_value = safe_float(
-            cycle_mode
-        )
-
-        if np.isfinite(mode_value):
-
-            distance = (
-                abs(gap - mode_value)
-                / mode_value
-            )
-
-            if distance > CYCLE_TOLERANCE:
-                continue
-
-        gaps.append(gap)
-
-    if not gaps:
-
-        return (
-            np.nan,
-            np.nan,
-            np.nan,
-            0,
-            np.nan,
-        )
-
-    median_gap = float(
-        np.median(gaps)
-    )
-
-    mean_gap = float(
-        np.mean(gaps)
-    )
-
-    std_gap = float(
-        np.std(gaps)
-    )
-
-    if mean_gap > 0:
-
-        cv = (
-            std_gap
-            / mean_gap
-        )
-
-        stability = float(
-            np.clip(
-                1.0 - cv,
-                0.0,
-                1.0,
-            )
-        )
-
-    else:
-
-        stability = np.nan
-
-    return (
-        median_gap,
-        mean_gap,
-        std_gap,
-        len(gaps),
-        stability,
-    )
-
-
-def cycle_stability_from_pairs(
-    cycle_pairs,
-    cycle_mode,
-):
-
-    if not cycle_pairs:
-        return np.nan
-
-    mode = safe_float(
-        cycle_mode
-    )
-
-    if (
-        not np.isfinite(mode)
-        or mode <= 0
-    ):
-        return np.nan
-
-    direct = []
-
-    for pair in cycle_pairs:
-
-        gap = safe_float(
-            pair["gap"]
-        )
-
-        if not np.isfinite(gap):
-            continue
-
-        distance = (
-            abs(gap - mode)
-            / mode
-        )
-
-        if distance <= CYCLE_TOLERANCE:
-            direct.append(gap)
-
-    if len(direct) < 2:
-        return np.nan
-
-    median = float(
-        np.median(direct)
-    )
-
-    deviations = [
-        abs(value - median)
-        / median
-        for value in direct
-        if median > 0
-    ]
-
-    if not deviations:
-        return np.nan
-
-    mean_deviation = float(
-        np.mean(deviations)
-    )
-
-    return float(
-        np.clip(
-            1.0
-            - (
-                mean_deviation
-                / max(
-                    CYCLE_TOLERANCE,
-                    1e-9,
-                )
-            ),
-            0.0,
-            1.0,
-        )
-    )
-
-
-# ============================================================
-# CLUSTER IDS
+# BASE CLUSTER ID
 # ============================================================
 
 def make_base_cluster_id(
     symbol,
     pattern,
-    events,
+    centroid,
 ):
 
-    signatures = [
-        event["signature"]
-        for event in events
-    ]
+    vector = np.asarray(
+        centroid,
+        dtype=float,
+    )
 
-    if signatures:
-
-        centroid = np.mean(
-            signatures,
-            axis=0,
-        )
-
-        norm = np.linalg.norm(
-            centroid
-        )
-
-        if norm > 1e-12:
-            centroid = (
-                centroid / norm
-            )
-
-        quantized = np.round(
-            centroid,
-            3,
-        )
-
-        fingerprint = ",".join(
-            f"{value:.3f}"
-            for value in quantized
-        )
-
-    else:
-
-        fingerprint = "EMPTY"
+    fingerprint = np.round(
+        vector,
+        3,
+    ).tobytes()
 
     raw = (
         f"{symbol}|"
         f"{pattern}|"
-        f"{fingerprint}"
+        f"{hashlib.sha1(fingerprint).hexdigest()}"
     )
 
     digest = hashlib.sha1(
-        raw.encode("utf-8")
+        raw.encode(
+            "utf-8"
+        )
     ).hexdigest()[:10]
 
     return (
@@ -2041,36 +2451,24 @@ def make_base_cluster_id(
     )
 
 
-def make_cycle_cluster_id(
+def make_cluster_id(
     symbol,
-    base_cluster_id,
     cycle_type,
+    base_cluster_id,
     cycle_mode,
 ):
-
-    mode_value = (
-        "NA"
-        if not np.isfinite(
-            safe_float(cycle_mode)
-        )
-        else str(
-            int(
-                round(
-                    float(cycle_mode)
-                )
-            )
-        )
-    )
 
     raw = (
         f"{symbol}|"
         f"{base_cluster_id}|"
         f"{cycle_type}|"
-        f"{mode_value}"
+        f"{round(cycle_mode, 1)}"
     )
 
     digest = hashlib.sha1(
-        raw.encode("utf-8")
+        raw.encode(
+            "utf-8"
+        )
     ).hexdigest()[:10]
 
     return (
@@ -2081,155 +2479,240 @@ def make_cycle_cluster_id(
 
 
 # ============================================================
-# ORDERED STATS
+# ORDERED STATISTICS
 # ============================================================
 
-def ordered_stats(events):
+def calculate_ordered_stats(
+    events
+):
 
-    if not events:
+    plus5 = []
+    plus10 = []
+    plus20 = []
+    minus5 = []
 
-        return {
-            "plus5_first_count": 0,
-            "plus5_first_rate": np.nan,
-            "plus10_first_count": 0,
-            "plus10_first_rate": np.nan,
-            "plus20_first_count": 0,
-            "plus20_first_rate": np.nan,
-            "minus5_first_count": 0,
-            "minus5_first_rate": np.nan,
-            "plus5_valid_n": 0,
-            "plus10_valid_n": 0,
-            "plus20_valid_n": 0,
-            "minus5_valid_n": 0,
-            "ambiguous_count": 0,
-            "no_hit_count": 0,
-        }
+    ambiguous = 0
+    no_hit = 0
+    resolved = 0
 
-    def field_stats(field):
+    first_plus5 = 0
+    first_plus10 = 0
+    first_plus20 = 0
+    first_minus5 = 0
 
-        values = []
+    success_count = 0
 
-        for event in events:
+    for event in events:
 
-            value = safe_float(
-                event.get(
-                    field,
-                    np.nan,
-                )
+        ordered = event[
+            "ordered"
+        ]
+
+        status = ordered[
+            "outcome_status"
+        ]
+
+        if status == "AMBIGUOUS":
+
+            ambiguous += 1
+
+        elif status == "NO_HIT":
+
+            no_hit += 1
+
+        elif status == "RESOLVED":
+
+            resolved += 1
+
+        value = ordered[
+            "plus5_first"
+        ]
+
+        if np.isfinite(
+            safe_float(value)
+        ):
+
+            plus5.append(
+                value
             )
 
-            if np.isfinite(value):
-                values.append(value)
+            if (
+                safe_float(value)
+                == 1.0
+            ):
 
-        if not values:
-            return 0, np.nan, 0
+                first_plus5 += 1
 
-        wins = sum(
-            value == 1.0
-            for value in values
-        )
+        value = ordered[
+            "plus10_first"
+        ]
 
-        return (
-            wins,
-            float(
-                wins / len(values)
-            ),
-            len(values),
-        )
+        if np.isfinite(
+            safe_float(value)
+        ):
 
-    plus5_count, plus5_rate, plus5_n = (
-        field_stats("plus5_first")
-    )
+            plus10.append(
+                value
+            )
 
-    plus10_count, plus10_rate, plus10_n = (
-        field_stats("plus10_first")
-    )
+            if (
+                safe_float(value)
+                == 1.0
+            ):
 
-    plus20_count, plus20_rate, plus20_n = (
-        field_stats("plus20_first")
-    )
+                first_plus10 += 1
 
-    minus5_count, minus5_rate, minus5_n = (
-        field_stats("minus5_first")
-    )
+        value = ordered[
+            "plus20_first"
+        ]
 
-    ambiguous_count = sum(
-        event.get("first_event")
-        == "AMBIGUOUS"
-        for event in events
-    )
+        if np.isfinite(
+            safe_float(value)
+        ):
 
-    no_hit_count = sum(
-        event.get("outcome_status")
-        == "NO_HIT"
-        for event in events
-    )
+            plus20.append(
+                value
+            )
+
+            if (
+                safe_float(value)
+                == 1.0
+            ):
+
+                first_plus20 += 1
+
+        value = ordered[
+            "minus5_first"
+        ]
+
+        if np.isfinite(
+            safe_float(value)
+        ):
+
+            minus5.append(
+                value
+            )
+
+            if (
+                safe_float(value)
+                == 1.0
+            ):
+
+                first_minus5 += 1
+
+        if (
+            ordered[
+                "first_event"
+            ]
+            == "PLUS_5"
+        ):
+
+            success_count += 1
 
     return {
-        "plus5_first_count":
-            plus5_count,
-
-        "plus5_first_rate":
-            plus5_rate,
-
-        "plus10_first_count":
-            plus10_count,
-
-        "plus10_first_rate":
-            plus10_rate,
-
-        "plus20_first_count":
-            plus20_count,
-
-        "plus20_first_rate":
-            plus20_rate,
-
-        "minus5_first_count":
-            minus5_count,
-
-        "minus5_first_rate":
-            minus5_rate,
 
         "plus5_valid_n":
-            plus5_n,
+            len(plus5),
 
         "plus10_valid_n":
-            plus10_n,
+            len(plus10),
 
         "plus20_valid_n":
-            plus20_n,
+            len(plus20),
 
         "minus5_valid_n":
-            minus5_n,
+            len(minus5),
+
+        "plus5_first_count":
+            first_plus5,
+
+        "plus10_first_count":
+            first_plus10,
+
+        "plus20_first_count":
+            first_plus20,
+
+        "minus5_first_count":
+            first_minus5,
+
+        "plus5_first_rate":
+            safe_mean(plus5),
+
+        "plus10_first_rate":
+            safe_mean(plus10),
+
+        "plus20_first_rate":
+            safe_mean(plus20),
+
+        "minus5_first_rate":
+            safe_mean(minus5),
 
         "ambiguous_count":
-            ambiguous_count,
+            ambiguous,
 
         "no_hit_count":
-            no_hit_count,
+            no_hit,
+
+        "resolved_count":
+            resolved,
+
+        "success_count":
+            success_count,
+
+        "success_rate":
+            (
+                success_count
+                / resolved
+                if resolved > 0
+                else np.nan
+            ),
     }
 
 
 # ============================================================
-# RECENT STATS
+# RECENT STATISTICS
 # ============================================================
 
-def recent_ordered_stats(
-    events,
-    count=RECENT_OCCURRENCES,
+def recent_statistics(
+    events
 ):
+
+    if not events:
+
+        return {
+            "recent_occurrences":
+                0,
+
+            "recent_plus5_first_pct":
+                np.nan,
+
+            "recent_plus10_first_pct":
+                np.nan,
+
+            "recent_plus20_first_pct":
+                np.nan,
+
+            "recent_minus5_first_pct":
+                np.nan,
+        }
 
     ordered = sorted(
         events,
-        key=lambda x:
-        pd.Timestamp(x["date"]),
+        key=lambda e: pd.Timestamp(
+            e["date"]
+        ),
     )
 
-    recent = ordered[-count:]
+    recent = ordered[
+        -RECENT_OCCURRENCES:
+    ]
 
-    stats = ordered_stats(recent)
+    stats = calculate_ordered_stats(
+        recent
+    )
 
     return {
+
         "recent_occurrences":
             len(recent),
 
@@ -2269,157 +2752,199 @@ def recent_ordered_stats(
 
 def validation_status(
     occurrences,
-    cycle_stability,
     cycle_observations,
+    cycle_stability,
 ):
 
-    if occurrences < 2:
-        return "PROVISIONAL"
+    if occurrences < MIN_DRIVER_OCCURRENCES:
 
-    if occurrences < VALIDATED_OCCURRENCES:
-        return "REPEAT_DETECTED"
-
-    stability = safe_float(
-        cycle_stability
-    )
+        return (
+            "INSUFFICIENT_OCCURRENCES"
+        )
 
     if (
-        np.isfinite(stability)
-        and stability < MIN_CYCLE_STABILITY
+        cycle_observations
+        < MIN_CYCLE_OBSERVATIONS
     ):
-        return "LOW_CYCLE_STABILITY"
 
-    if cycle_observations < 2:
-        return "INSUFFICIENT_CYCLE"
+        return (
+            "LOW_CYCLE_REPEAT"
+        )
 
-    if occurrences >= STABLE_OCCURRENCES:
-        return "STABLE"
+    if (
+        np.isfinite(
+            safe_float(
+                cycle_stability
+            )
+        )
+        and cycle_stability
+        < MIN_CYCLE_STABILITY
+    ):
 
-    return "VALIDATED"
+        return (
+            "LOW_CYCLE_STABILITY"
+        )
+
+    if occurrences < VALIDATED_OCCURRENCES:
+
+        return "REPEAT_DETECTED"
+
+    if occurrences < STABLE_OCCURRENCES:
+
+        return "VALIDATED"
+
+    return "STABLE"
 
 
 def driver_state(
-    similarity,
-    occurrences,
-    history_length,
+    current_similarity,
     validation,
 ):
 
-    if occurrences < 2:
-
-        if history_length < 300:
-            return "PROVISIONAL"
-
-        return "INACTIVE"
-
     if validation in {
-        "LOW_CYCLE_STABILITY",
-        "INSUFFICIENT_CYCLE",
+        "INSUFFICIENT_OCCURRENCES",
+        "LOW_CYCLE_REPEAT",
     }:
 
-        if similarity >= CURRENT_ACTIVE_SIM:
+        return "PROVISIONAL"
+
+    if validation == (
+        "LOW_CYCLE_STABILITY"
+    ):
+
+        if (
+            current_similarity
+            >= CURRENT_ACTIVE_SIM
+        ):
+
             return "WATCH"
 
         return "INACTIVE"
 
-    if similarity >= CURRENT_ACTIVE_SIM:
+    if (
+        current_similarity
+        >= CURRENT_ACTIVE_SIM
+    ):
+
         return "ACTIVE"
 
-    if similarity >= CURRENT_WATCH_SIM:
+    if (
+        current_similarity
+        >= CURRENT_WATCH_SIM
+    ):
+
         return "WATCH"
 
     return "INACTIVE"
 
 
-def allowed_driver_count(history_length):
-
-    if history_length < 300:
-        return 1
-
-    if history_length < 700:
-        return min(2, MAX_DRIVERS)
-
-    return MAX_DRIVERS
-
-
 # ============================================================
-# TARGETS
+# TARGET / INVALIDATION
 # ============================================================
 
-def historical_levels(
-    events,
+def calculate_targets(
     current_price,
+    events,
 ):
 
+    if (
+        not np.isfinite(
+            current_price
+        )
+        or current_price <= 0
+    ):
+
+        return (
+            np.nan,
+            np.nan,
+            np.nan,
+        )
+
     ups = finite_values(
-        event["max_up"]
-        for event in events
+        [
+            event[
+                "max_up"
+            ]
+            for event in events
+        ]
     )
 
     downs = finite_values(
-        event["max_down"]
-        for event in events
+        [
+            event[
+                "max_down"
+            ]
+            for event in events
+        ]
     )
 
     if ups.empty:
 
-        target1 = current_price * 1.05
-        target2 = current_price * 1.10
+        target1_return = 0.05
+        target2_return = 0.10
 
     else:
 
-        up50 = float(
-            ups.quantile(0.50)
+        target1_return = max(
+            0.05,
+            min(
+                0.10,
+                float(
+                    ups.median()
+                ),
+            ),
         )
 
-        up75 = float(
-            ups.quantile(0.75)
-        )
-
-        target1 = (
-            current_price
-            * (
-                1
-                + max(
-                    0.03,
-                    up50 * 0.60,
-                )
-            )
-        )
-
-        target2 = (
-            current_price
-            * (
-                1
-                + max(
-                    0.05,
-                    up75 * 0.70,
-                )
-            )
+        target2_return = max(
+            target1_return,
+            min(
+                0.30,
+                float(
+                    ups.quantile(
+                        0.75
+                    )
+                ),
+            ),
         )
 
     if downs.empty:
 
-        invalidation = (
-            current_price * 0.95
+        invalidation_return = (
+            -0.05
         )
 
     else:
 
-        down25 = float(
-            downs.quantile(0.25)
+        invalidation_return = min(
+            -0.05,
+            float(
+                downs.median()
+            ),
         )
 
-        invalidation = (
-            current_price
-            * (
-                1
-                + min(
-                    -0.03,
-                    down25 * 0.75,
-                )
-            )
+    target1 = (
+        current_price
+        * (
+            1
+            + target1_return
         )
+    )
+
+    target2 = (
+        current_price
+        * (
+            1
+            + target2_return
+        )
+    )
+
+    invalidation = (
+        current_price
+        * (
+            1
+            + invalidation_return
+        )
+    )
 
     return (
         target1,
@@ -2429,82 +2954,142 @@ def historical_levels(
 
 
 # ============================================================
-# CURRENT PHASE
+# DRIVER SCORE
 # ============================================================
 
-def current_phase(df):
+def driver_score(
+    current_similarity,
+    occurrences,
+    plus5_first_rate,
+    cycle_stability,
+    recent_plus5,
+):
 
-    if len(df) < 60:
-        return "INSUFFICIENT_HISTORY"
-
-    last = df.iloc[-1]
-
-    close = safe_float(
-        last["Close"]
-    )
-
-    ma20 = safe_float(
-        last["ma20"]
-    )
-
-    ma50 = safe_float(
-        last["ma50"]
-    )
-
-    slope20 = safe_float(
-        last.get("slope20", 0),
-        0,
-    )
-
-    volume_ratio = safe_float(
-        last.get("vol_ratio", 1),
-        1,
-    )
-
-    recent_high = safe_float(
-        df["High"].tail(20).max()
-    )
-
-    recent_low = safe_float(
-        df["Low"].tail(20).min()
-    )
-
-    if (
-        close >= recent_high * 0.995
-        and volume_ratio >= 1.25
+    def clamp(
+        value,
+        default=0.0,
     ):
-        return "BREAKOUT"
 
-    if close <= recent_low * 1.005:
-        return "BREAKDOWN"
+        value = safe_float(
+            value,
+            default,
+        )
 
-    if (
-        np.isfinite(ma20)
-        and np.isfinite(ma50)
-        and close > ma20 > ma50
-        and slope20 > 0
-    ):
-        return "UPTREND"
+        if not np.isfinite(value):
+            return default
 
-    if (
-        np.isfinite(ma20)
-        and np.isfinite(ma50)
-        and close < ma20 < ma50
-        and slope20 < 0
-    ):
-        return "DOWNTREND"
+        return float(
+            np.clip(
+                value,
+                0,
+                1,
+            )
+        )
 
-    if (
-        recent_high > 0
-        and close > 0
-        and (
-            recent_high
-            - recent_low
-        ) / close < 0.12
-    ):
-        return "COMPRESSION"
+    sim = clamp(
+        current_similarity
+    )
 
-    return "TRANSITION"
+    occurrence_score = clamp(
+        min(
+            occurrences / 8.0,
+            1.0,
+        )
+    )
+
+    plus5 = clamp(
+        plus5_first_rate
+    )
+
+    cycle = clamp(
+        cycle_stability
+    )
+
+    recent = clamp(
+        recent_plus5
+    )
+
+    score = (
+        sim * 0.30
+        + occurrence_score * 0.15
+        + plus5 * 0.20
+        + cycle * 0.20
+        + recent * 0.15
+    )
+
+    return float(
+        score
+    )
+
+
+# ============================================================
+# DUPLICATE CHECK
+# ============================================================
+
+def is_duplicate_driver(
+    candidate,
+    selected,
+):
+
+    for existing in selected:
+
+        base_similarity = (
+            cosine_similarity(
+                candidate[
+                    "cluster"
+                ][
+                    "centroid"
+                ],
+                existing[
+                    "cluster"
+                ][
+                    "centroid"
+                ],
+            )
+        )
+
+        if (
+            base_similarity
+            >= DUPLICATE_SIM
+        ):
+
+            c1 = safe_float(
+                candidate[
+                    "cycle_mode"
+                ]
+            )
+
+            c2 = safe_float(
+                existing[
+                    "cycle_mode"
+                ]
+            )
+
+            if (
+                np.isfinite(c1)
+                and np.isfinite(c2)
+            ):
+
+                ratio = (
+                    max(c1, c2)
+                    / max(
+                        min(c1, c2),
+                        1,
+                    )
+                )
+
+                if (
+                    ratio
+                    < DUPLICATE_CYCLE_RATIO
+                ):
+
+                    return True
+
+            else:
+
+                return True
+
+    return False
 
 
 # ============================================================
@@ -2513,22 +3098,27 @@ def current_phase(df):
 
 def make_history_row(
     symbol,
-    driver_rank,
+    rank,
     driver_name,
     cluster_id,
     pattern,
     cycle_type,
     cycle_mode,
     event,
-    base_cluster_id=None,
+    base_cluster_id,
 ):
 
+    ordered = event[
+        "ordered"
+    ]
+
     return {
+
         "symbol":
             symbol,
 
         "driver_rank":
-            driver_rank,
+            rank,
 
         "driver_name":
             driver_name,
@@ -2538,6 +3128,17 @@ def make_history_row(
 
         "base_cluster_id":
             base_cluster_id,
+
+        "date":
+            date_string(
+                event["date"]
+            ),
+
+        "price":
+            rnd(
+                event["price"],
+                4,
+            ),
 
         "pattern":
             pattern,
@@ -2551,102 +3152,84 @@ def make_history_row(
                 1,
             ),
 
-        "event_date":
-            pd.Timestamp(
-                event["date"]
-            )
-            .date()
-            .isoformat(),
-
         "forward_return_pct":
-            pct(
-                event.get(
-                    "forward_return",
-                    np.nan,
-                )
+            rnd(
+                event[
+                    "forward_return"
+                ] * 100,
+                2,
             ),
 
         "max_up_pct":
-            pct(
-                event.get(
-                    "max_up",
-                    np.nan,
-                )
+            rnd(
+                event[
+                    "max_up"
+                ] * 100,
+                2,
             ),
 
         "max_down_pct":
-            pct(
-                event.get(
-                    "max_down",
-                    np.nan,
-                )
+            rnd(
+                event[
+                    "max_down"
+                ] * 100,
+                2,
             ),
 
         "first_event":
-            event.get(
-                "first_event",
-                "NONE",
-            ),
+            ordered[
+                "first_event"
+            ],
 
         "first_day":
-            event.get(
-                "first_day",
-                np.nan,
-            ),
-
-        "outcome_status":
-            event.get(
-                "outcome_status",
-                "NO_HIT",
-            ),
+            ordered[
+                "first_day"
+            ],
 
         "plus5_first":
-            event.get(
-                "plus5_first",
-                np.nan,
-            ),
+            ordered[
+                "plus5_first"
+            ],
 
         "plus10_first":
-            event.get(
-                "plus10_first",
-                np.nan,
-            ),
+            ordered[
+                "plus10_first"
+            ],
 
         "plus20_first":
-            event.get(
-                "plus20_first",
-                np.nan,
-            ),
+            ordered[
+                "plus20_first"
+            ],
 
         "minus5_first":
-            event.get(
-                "minus5_first",
-                np.nan,
-            ),
+            ordered[
+                "minus5_first"
+            ],
 
         "days_to_plus5":
-            event.get(
-                "days_to_plus5",
-                np.nan,
-            ),
+            ordered[
+                "days_to_plus5"
+            ],
 
         "days_to_plus10":
-            event.get(
-                "days_to_plus10",
-                np.nan,
-            ),
+            ordered[
+                "days_to_plus10"
+            ],
 
         "days_to_plus20":
-            event.get(
-                "days_to_plus20",
-                np.nan,
-            ),
+            ordered[
+                "days_to_plus20"
+            ],
 
         "days_to_minus5":
-            event.get(
-                "days_to_minus5",
-                np.nan,
-            ),
+            ordered[
+                "days_to_minus5"
+            ],
+
+        "outcome_status":
+            ordered[
+                "outcome_status"
+            ],
     }
 
 
@@ -2654,20 +3237,18 @@ def make_history_row(
 # ANALYZE SYMBOL
 # ============================================================
 
-def analyze_symbol(symbol):
-
-    symbol = (
-        str(symbol)
-        .strip()
-        .upper()
-    )
+def analyze_symbol(
+    symbol
+):
 
     print()
     print(
         f"===== DRIVER: {symbol} ====="
     )
 
-    raw = download_price(symbol)
+    raw = download_price(
+        symbol
+    )
 
     if raw.empty:
 
@@ -2676,1046 +3257,641 @@ def analyze_symbol(symbol):
             "no price data"
         )
 
-        return [], [], []
+        return (
+            [],
+            [],
+            [],
+        )
 
-    df = add_features(raw)
-
-    usable = df.dropna(
-        subset=["Close"]
-    ).copy()
-
-    history_length = len(usable)
-
-    if history_length < MIN_HISTORY:
+    if len(raw) < MIN_HISTORY:
 
         print(
             f"[SKIP] {symbol}: "
-            f"history={history_length} "
+            f"history={len(raw)} "
             f"< {MIN_HISTORY}"
         )
 
-        return [], [], []
+        return (
+            [],
+            [],
+            [],
+        )
 
-    events = extract_events(usable)
+    df = add_features(
+        raw
+    )
+
+    # feature warmup
+    df = df.dropna(
+        subset=[
+            "Close",
+            "ma20",
+            "ma50",
+            "ma100",
+            "ma200",
+        ]
+    ).copy()
+
+    if len(df) < (
+        MIN_HISTORY
+        + FORWARD
+    ):
+
+        print(
+            f"[SKIP] {symbol}: "
+            "not enough usable history"
+        )
+
+        return (
+            [],
+            [],
+            [],
+        )
+
+    events = extract_events(
+        df
+    )
 
     print(
         f"[INFO] {symbol}: "
         f"raw_events={len(events)}"
     )
 
-    # --------------------------------------------------------
-    # Single event
-    # --------------------------------------------------------
-
-    if len(events) == 1:
-
-        event = events[0]
-
-        current_window = usable.iloc[-WINDOW:].copy()
-
-        current_signature = make_signature(
-            current_window
-        )
-
-        similarity = cosine_similarity(
-            current_signature,
-            event["signature"],
-        )
-
-        current_price = safe_float(
-            usable["Close"].iloc[-1]
-        )
-
-        pattern = event["label"]
-
-        target1, target2, invalidation = (
-            historical_levels(
-                [event],
-                current_price,
-            )
-        )
-
-        base_cluster_id = make_base_cluster_id(
-            symbol,
-            pattern,
-            [event],
-        )
-
-        cluster_id = make_cycle_cluster_id(
-            symbol,
-            base_cluster_id,
-            "단기",
-            np.nan,
-        )
-
-        phase = current_phase(usable)
-
-        current = {
-            "symbol":
-                symbol,
-
-            "as_of":
-                usable.index[-1]
-                .date()
-                .isoformat(),
-
-            "current_price":
-                rnd(
-                    current_price,
-                    4,
-                ),
-
-            "active_driver":
-                "DRIVER_1",
-
-            "cluster_id":
-                cluster_id,
-
-            "base_cluster_id":
-                base_cluster_id,
-
-            "pattern":
-                f"[단기] {pattern}",
-
-            "cycle_type":
-                "단기",
-
-            "cycle_mode_days":
-                np.nan,
-
-            "cycle_stability_pct":
-                np.nan,
-
-            "state":
-                "PROVISIONAL",
-
-            "phase":
-                phase,
-
-            "similarity_pct":
-                rnd(
-                    similarity * 100,
-                    2,
-                ),
-
-            "success_rate_pct":
-                np.nan,
-
-            "plus5_first_pct":
-                np.nan,
-
-            "plus10_first_pct":
-                np.nan,
-
-            "plus20_first_pct":
-                np.nan,
-
-            "minus5_first_pct":
-                np.nan,
-
-            "recent_occurrences":
-                1,
-
-            "recent_plus5_first_pct":
-                np.nan,
-
-            "recent_plus10_first_pct":
-                np.nan,
-
-            "recent_plus20_first_pct":
-                np.nan,
-
-            "recent_minus5_first_pct":
-                np.nan,
-
-            "target1":
-                rnd(
-                    target1,
-                    4,
-                ),
-
-            "target2":
-                rnd(
-                    target2,
-                    4,
-                ),
-
-            "invalidation":
-                rnd(
-                    invalidation,
-                    4,
-                ),
-
-            "occurrences":
-                1,
-
-            "cycle_status":
-                "INSUFFICIENT_REPEAT",
-
-            "validation_status":
-                "PROVISIONAL",
-        }
-
-        profile = {
-            "symbol":
-                symbol,
-
-            "driver_rank":
-                1,
-
-            "driver_name":
-                "DRIVER_1",
-
-            "cluster_id":
-                cluster_id,
-
-            "base_cluster_id":
-                base_cluster_id,
-
-            "pattern":
-                f"[단기] {pattern}",
-
-            "cycle_type":
-                "단기",
-
-            "cycle_mode_days":
-                np.nan,
-
-            "cycle_stability_pct":
-                np.nan,
-
-            "state":
-                "PROVISIONAL",
-
-            "validation_status":
-                "PROVISIONAL",
-
-            "phase":
-                phase,
-
-            "history_days":
-                history_length,
-
-            "current_price":
-                rnd(
-                    current_price,
-                    4,
-                ),
-
-            "current_similarity_pct":
-                rnd(
-                    similarity * 100,
-                    2,
-                ),
-
-            "occurrences":
-                1,
-
-            "success_count":
-                np.nan,
-
-            "success_rate_pct":
-                np.nan,
-
-            "plus5_first_count":
-                np.nan,
-
-            "plus5_first_rate_pct":
-                np.nan,
-
-            "plus5_valid_n":
-                np.nan,
-
-            "plus10_first_count":
-                np.nan,
-
-            "plus10_first_rate_pct":
-                np.nan,
-
-            "plus10_valid_n":
-                np.nan,
-
-            "plus20_first_count":
-                np.nan,
-
-            "plus20_first_rate_pct":
-                np.nan,
-
-            "plus20_valid_n":
-                np.nan,
-
-            "minus5_first_count":
-                np.nan,
-
-            "minus5_first_rate_pct":
-                np.nan,
-
-            "minus5_valid_n":
-                np.nan,
-
-            "ambiguous_count":
-                np.nan,
-
-            "no_hit_count":
-                np.nan,
-
-            "recent_occurrences":
-                1,
-
-            "recent_plus5_first_pct":
-                np.nan,
-
-            "recent_plus10_first_pct":
-                np.nan,
-
-            "recent_plus20_first_pct":
-                np.nan,
-
-            "recent_minus5_first_pct":
-                np.nan,
-
-            "avg_forward_return_pct":
-                pct(
-                    event.get(
-                        "forward_return",
-                        np.nan,
-                    )
-                ),
-
-            "median_forward_return_pct":
-                pct(
-                    event.get(
-                        "forward_return",
-                        np.nan,
-                    )
-                ),
-
-            "median_max_up_pct":
-                pct(
-                    event.get(
-                        "max_up",
-                        np.nan,
-                    )
-                ),
-
-            "median_max_down_pct":
-                pct(
-                    event.get(
-                        "max_down",
-                        np.nan,
-                    )
-                ),
-
-            "median_cycle_days":
-                np.nan,
-
-            "mean_cycle_days":
-                np.nan,
-
-            "cycle_std_days":
-                np.nan,
-
-            "cycle_observations":
-                0,
-
-            "target1":
-                rnd(
-                    target1,
-                    4,
-                ),
-
-            "target2":
-                rnd(
-                    target2,
-                    4,
-                ),
-
-            "invalidation":
-                rnd(
-                    invalidation,
-                    4,
-                ),
-
-            "first_seen":
-                pd.Timestamp(
-                    event["date"]
-                )
-                .date()
-                .isoformat(),
-
-            "last_seen":
-                pd.Timestamp(
-                    event["date"]
-                )
-                .date()
-                .isoformat(),
-        }
-
-        history = make_history_row(
-            symbol,
-            1,
-            "DRIVER_1",
-            cluster_id,
-            f"[단기] {pattern}",
-            "단기",
-            np.nan,
-            event,
-            base_cluster_id,
-        )
-
-        print(
-            f"[OK] {symbol}: "
-            f"PROVISIONAL "
-            f"cluster={cluster_id}"
-        )
-
-        return (
-            [profile],
-            [current],
-            [history],
-        )
-
-    # --------------------------------------------------------
-    # Not enough recurring events
-    # --------------------------------------------------------
-
-    if len(events) < 2:
+    if len(events) < (
+        MIN_DRIVER_OCCURRENCES
+    ):
 
         print(
             f"[SKIP] {symbol}: "
             "not enough recurring events"
         )
 
-        return [], [], []
-
-    # --------------------------------------------------------
-    # Pattern clustering
-    # --------------------------------------------------------
-
-    raw_clusters = cluster_patterns(
-        events,
-        CLUSTER_SIM,
-    )
-
-    recurring_clusters = [
-        cluster
-        for cluster in raw_clusters
-        if len(cluster["events"])
-        >= MIN_DRIVER_OCCURRENCES
-    ]
-
-    if not recurring_clusters:
-
-        print(
-            f"[SKIP] {symbol}: "
-            "no recurring pattern cluster"
+        return (
+            [],
+            [],
+            [],
         )
 
-        return [], [], []
-
     # ========================================================
-    # Cycle Split
+    # Pattern clustering
     # ========================================================
 
-    cycle_clusters = []
+    pattern_clusters = cluster_events(
+        events
+    )
 
-    for cluster in recurring_clusters:
+    candidates = []
 
-        groups = cycle_groups(
+    # ========================================================
+    # 각 pattern cluster마다 cycle 분석
+    # ========================================================
+
+    for cluster in pattern_clusters:
+
+        cluster_events_list = (
             cluster["events"]
         )
 
-        # ----------------------------------------------------
-        # 원본 Pattern Cluster centroid
-        # ----------------------------------------------------
+        if len(
+            cluster_events_list
+        ) < MIN_DRIVER_OCCURRENCES:
 
-        source_centroid = cluster.get(
-            "centroid"
+            continue
+
+        cycle_result = select_cycle_base(
+            cluster_events_list
         )
-
-        if source_centroid is None:
-
-            signatures = [
-                event["signature"]
-                for event in cluster["events"]
-            ]
-
-            if signatures:
-
-                source_centroid = np.mean(
-                    signatures,
-                    axis=0,
-                )
-
-                norm = np.linalg.norm(
-                    source_centroid
-                )
-
-                if norm > 1e-12:
-
-                    source_centroid = (
-                        source_centroid
-                        / norm
-                    )
-
-            else:
-
-                source_centroid = np.zeros(
-                    len(
-                        cluster["events"][0][
-                            "signature"
-                        ]
-                    )
-                )
-
-        # ----------------------------------------------------
-        # 각각의 Cycle Group
-        # ----------------------------------------------------
-
-        for group in groups:
-
-            group_events = group.get(
-                "events",
-                [],
-            )
-
-            if len(group_events) < MIN_DRIVER_OCCURRENCES:
-                continue
-
-            labels = [
-                event["label"]
-                for event in group_events
-            ]
-
-            modes = pd.Series(
-                labels
-            ).mode()
-
-            pattern = (
-                str(modes.iloc[0])
-                if not modes.empty
-                else "구조불명"
-            )
-
-            # 중요:
-            # Cycle Group 때문에 base ID를 다시 만들지 않는다.
-            # 원본 Pattern Cluster의 centroid를 기반으로
-            # 동일한 Base Driver를 유지한다.
-            base_cluster_id = (
-                make_base_cluster_id(
-                    symbol,
-                    pattern,
-                    cluster["events"],
-                )
-            )
-
-            cycle_clusters.append(
-                {
-                    "events":
-                        group_events,
-
-                    "cycle_type":
-                        group.get(
-                            "cycle_type",
-                            "단기",
-                        ),
-
-                    "cycle_mode":
-                        group.get(
-                            "cycle_mode",
-                            np.nan,
-                        ),
-
-                    "cycle_observations":
-                        group.get(
-                            "cycle_observations",
-                            0,
-                        ),
-
-                    "cycle_pairs":
-                        group.get(
-                            "cycle_pairs",
-                            [],
-                        ),
-
-                    # ★ 핵심 수정
-                    # duplicate suppression에서 사용
-                    "centroid":
-                        source_centroid.copy(),
-
-                    "base_cluster_id":
-                        base_cluster_id,
-                }
-            )
-
-    if not cycle_clusters:
-
-        print(
-            f"[SKIP] {symbol}: "
-            "no cycle-validated Driver"
-        )
-
-        return [], [], []
-
-    # ========================================================
-    # Current
-    # ========================================================
-
-    current_window = usable.iloc[-WINDOW:].copy()
-
-    current_signature = make_signature(
-        current_window
-    )
-
-    current_price = safe_float(
-        usable["Close"].iloc[-1]
-    )
-
-    phase = current_phase(
-        usable
-    )
-
-    driver_candidates = []
-
-    # ========================================================
-    # Analyze Cycle Clusters
-    # ========================================================
-
-    for cluster in cycle_clusters:
-
-        cluster_events = cluster["events"]
-
-        similarities = [
-            cosine_similarity(
-                current_signature,
-                event["signature"],
-            )
-            for event in cluster_events
-        ]
-
-        current_similarity = (
-            max(similarities)
-            if similarities
-            else 0.0
-        )
-
-        labels = [
-            event["label"]
-            for event in cluster_events
-        ]
-
-        modes = pd.Series(
-            labels
-        ).mode()
-
-        pattern = (
-            str(modes.iloc[0])
-            if not modes.empty
-            else "구조불명"
-        )
-
-        cycle_type = cluster[
-            "cycle_type"
-        ]
 
         cycle_mode = safe_float(
-            cluster["cycle_mode"]
-        )
-
-        (
-            cycle_median,
-            cycle_mean,
-            cycle_std,
-            cycle_obs,
-            cycle_stability,
-        ) = cycle_statistics(
-            cluster_events,
-            cycle_mode,
-        )
-
-        pair_stability = (
-            cycle_stability_from_pairs(
-                cluster.get(
-                    "cycle_pairs",
-                    [],
-                ),
-                cycle_mode,
+            cycle_result.get(
+                "base"
             )
         )
 
-        if np.isfinite(
-            safe_float(pair_stability)
+        cycle_observations = int(
+            cycle_result.get(
+                "observations",
+                0,
+            )
+        )
+
+        cycle_stability = safe_float(
+            cycle_result.get(
+                "stability"
+            )
+        )
+
+        # ----------------------------------------------------
+        # cycle이 검증되지 않은 pattern은
+        # 무조건 별도 driver로 만들지 않는다.
+        # 단, 3개 이상 occurrence가 있으면
+        # "반복은 있으나 cycle 미검증" 상태로 보존.
+        # ----------------------------------------------------
+
+        if (
+            not np.isfinite(
+                cycle_mode
+            )
+            or cycle_mode <= 0
         ):
 
-            final_cycle_stability = (
-                pair_stability
+            cycle_mode = np.nan
+
+        cycle_type = classify_cycle(
+            cycle_result
+        )
+
+        grouped_event_sets = []
+
+        if cycle_result.get(
+            "valid",
+            False,
+        ):
+
+            grouped_event_sets = (
+                cycle_group_events(
+                    cluster_events_list,
+                    cycle_result,
+                )
             )
 
         else:
 
-            final_cycle_stability = (
-                cycle_stability
-            )
+            grouped_event_sets = [
+                cluster_events_list
+            ]
 
-        display_cycle = (
-            cycle_mode
-            if np.isfinite(cycle_mode)
-            else cycle_median
-        )
+        for event_group in (
+            grouped_event_sets
+        ):
 
-        base_cluster_id = cluster[
-            "base_cluster_id"
-        ]
+            if len(event_group) < (
+                MIN_DRIVER_OCCURRENCES
+            ):
 
-        cluster_id = (
-            make_cycle_cluster_id(
-                symbol,
-                base_cluster_id,
-                cycle_type,
-                display_cycle,
-            )
-        )
+                continue
 
-        ordered = ordered_stats(
-            cluster_events
-        )
+            # ------------------------------------------------
+            # cycle group 내부에서
+            # 현재 구조와 가장 가까운 historical event
+            # 를 기준으로 centroid similarity 계산
+            # ------------------------------------------------
 
-        recent = recent_ordered_stats(
-            cluster_events
-        )
-
-        occurrence_count = len(
-            cluster_events
-        )
-
-        success_count = ordered[
-            "plus5_first_count"
-        ]
-
-        success_rate = ordered[
-            "plus5_first_rate"
-        ]
-
-        forward_returns = finite_values(
-            event["forward_return"]
-            for event in cluster_events
-        )
-
-        max_ups = finite_values(
-            event["max_up"]
-            for event in cluster_events
-        )
-
-        max_downs = finite_values(
-            event["max_down"]
-            for event in cluster_events
-        )
-
-        target1, target2, invalidation = (
-            historical_levels(
-                cluster_events,
-                current_price,
-            )
-        )
-
-        # ★ 기존 코드의 버그 수정
-        # cycle_observations 자리에
-        # plus5_valid_n을 넣으면 안 된다.
-        validation = validation_status(
-            occurrence_count,
-            final_cycle_stability,
-            (
-                cycle_obs
-                if cycle_obs > 0
-                else cluster[
-                    "cycle_observations"
+            signatures = [
+                event[
+                    "signature"
                 ]
+                for event
+                in event_group
+            ]
+
+            centroid = np.mean(
+                signatures,
+                axis=0,
+            )
+
+            norm = np.linalg.norm(
+                centroid
+            )
+
+            if norm > 1e-12:
+
+                centroid = (
+                    centroid / norm
+                )
+
+            cluster_copy = {
+                "pattern":
+                    cluster[
+                        "pattern"
+                    ],
+
+                "events":
+                    event_group,
+
+                "centroid":
+                    centroid,
+            }
+
+            candidates.append(
+                {
+                    "cluster":
+                        cluster_copy,
+
+                    "pattern":
+                        cluster[
+                            "pattern"
+                        ],
+
+                    "cycle_type":
+                        cycle_type,
+
+                    "cycle_mode":
+                        cycle_mode,
+
+                    "cycle_mean":
+                        safe_float(
+                            cycle_result.get(
+                                "mean"
+                            )
+                        ),
+
+                    "cycle_std":
+                        safe_float(
+                            cycle_result.get(
+                                "std"
+                            )
+                        ),
+
+                    "cycle_stability":
+                        cycle_stability,
+
+                    "cycle_observations":
+                        cycle_observations,
+
+                    "events":
+                        event_group,
+                }
+            )
+
+    if not candidates:
+
+        print(
+            f"[SKIP] {symbol}: "
+            "no driver candidates"
+        )
+
+        return (
+            [],
+            [],
+            [],
+        )
+
+    # ========================================================
+    # Current similarity
+    # ========================================================
+
+    current_window = df.iloc[
+        -WINDOW:
+    ]
+
+    current_signature = (
+        make_signature(
+            current_window
+        )
+    )
+
+    current_price = safe_float(
+        df["Close"].iloc[-1]
+    )
+
+    current_pattern = (
+        choose_pattern_label(
+            current_window
+        )
+    )
+
+    phase = (
+        "UPTREND"
+        if (
+            safe_float(
+                df["ma20_gap"].iloc[-1],
+                0,
+            ) > 0
+            and safe_float(
+                df["ma50_gap"].iloc[-1],
+                0,
+            ) > 0
+        )
+        else
+        "DOWNTREND"
+        if (
+            safe_float(
+                df["ma20_gap"].iloc[-1],
+                0,
+            ) < 0
+            and safe_float(
+                df["ma50_gap"].iloc[-1],
+                0,
+            ) < 0
+        )
+        else
+        "TRANSITION"
+    )
+
+    for candidate in candidates:
+
+        candidate[
+            "current_similarity"
+        ] = cosine_similarity(
+            current_signature,
+            candidate[
+                "cluster"
+            ][
+                "centroid"
+            ],
+        )
+
+        stats = calculate_ordered_stats(
+            candidate["events"]
+        )
+
+        recent = recent_statistics(
+            candidate["events"]
+        )
+
+        candidate[
+            "ordered"
+        ] = stats
+
+        candidate[
+            "recent"
+        ] = recent
+
+        candidate[
+            "occurrences"
+        ] = len(
+            candidate["events"]
+        )
+
+        candidate[
+            "success_count"
+        ] = stats[
+            "success_count"
+        ]
+
+        candidate[
+            "success_rate"
+        ] = stats[
+            "success_rate"
+        ]
+
+        candidate[
+            "score"
+        ] = driver_score(
+            candidate[
+                "current_similarity"
+            ],
+            candidate[
+                "occurrences"
+            ],
+            stats[
+                "plus5_first_rate"
+            ],
+            candidate[
+                "cycle_stability"
+            ],
+            (
+                safe_float(
+                    recent[
+                        "recent_plus5_first_pct"
+                )
+                / 100
+                )
+                if np.isfinite(
+                    safe_float(
+                        recent[
+                            "recent_plus5_first_pct"
+                        ]
+                    )
+                )
+                else np.nan
             ),
         )
 
-        state = driver_state(
-            current_similarity,
-            occurrence_count,
-            history_length,
-            validation,
+        candidate[
+            "validation_status"
+        ] = validation_status(
+            candidate[
+                "occurrences"
+            ],
+            candidate[
+                "cycle_observations"
+            ],
+            candidate[
+                "cycle_stability"
+            ],
         )
 
-        driver_candidates.append(
-            {
-                "cluster":
-                    cluster,
+        candidate[
+            "state"
+        ] = driver_state(
+            candidate[
+                "current_similarity"
+            ],
+            candidate[
+                "validation_status"
+            ],
+        )
 
-                "cluster_id":
-                    cluster_id,
+        (
+            target1,
+            target2,
+            invalidation,
+        ) = calculate_targets(
+            current_price,
+            candidate[
+                "events"
+            ],
+        )
 
-                "base_cluster_id":
-                    base_cluster_id,
+        candidate[
+            "target1"
+        ] = target1
 
-                "pattern":
-                    pattern,
+        candidate[
+            "target2"
+        ] = target2
 
-                "cycle_type":
-                    cycle_type,
+        candidate[
+            "invalidation"
+        ] = invalidation
 
-                "cycle_mode":
-                    display_cycle,
+        base_cluster_id = (
+            make_base_cluster_id(
+                symbol,
+                candidate[
+                    "pattern"
+                ],
+                candidate[
+                    "cluster"
+                ][
+                    "centroid"
+                ],
+            )
+        )
 
-                "cycle_observations":
-                    (
-                        cycle_obs
-                        if cycle_obs > 0
-                        else cluster[
-                            "cycle_observations"
+        candidate[
+            "base_cluster_id"
+        ] = base_cluster_id
+
+        candidate[
+            "cluster_id"
+        ] = make_cluster_id(
+            symbol,
+            candidate[
+                "cycle_type"
+            ],
+            base_cluster_id,
+            (
+                candidate[
+                    "cycle_mode"
+                ]
+                if np.isfinite(
+                    safe_float(
+                        candidate[
+                            "cycle_mode"
                         ]
-                    ),
-
-                "cycle_stability":
-                    final_cycle_stability,
-
-                "cycle_mean":
-                    cycle_mean,
-
-                "cycle_std":
-                    cycle_std,
-
-                "current_similarity":
-                    current_similarity,
-
-                "occurrences":
-                    occurrence_count,
-
-                "success_count":
-                    success_count,
-
-                "success_rate":
-                    success_rate,
-
-                "ordered":
-                    ordered,
-
-                "recent":
-                    recent,
-
-                "forward_returns":
-                    forward_returns,
-
-                "max_ups":
-                    max_ups,
-
-                "max_downs":
-                    max_downs,
-
-                "target1":
-                    target1,
-
-                "target2":
-                    target2,
-
-                "invalidation":
-                    invalidation,
-
-                "state":
-                    state,
-
-                "validation_status":
-                    validation,
-            }
+                    )
+                )
+                else 0
+            ),
         )
 
-    # ========================================================
-    # Candidate Score
-    # ========================================================
-
-    def candidate_score(item):
-
-        sim = max(
-            item["current_similarity"],
-            0.0,
-        )
-
-        occurrence = min(
-            item["occurrences"],
-            8,
-        ) / 8.0
-
-        success = safe_float(
-            item["success_rate"]
-        )
-
-        if not np.isfinite(success):
-            success = 0.0
-
-        cycle_stability = safe_float(
-            item["cycle_stability"]
-        )
-
-        if not np.isfinite(cycle_stability):
-            cycle_stability = 0.0
-
-        recent_success = safe_float(
-            item["recent"][
-                "recent_plus5_first_pct"
+        candidate[
+            "forward_returns"
+        ] = finite_values(
+            [
+                event[
+                    "forward_return"
+                ]
+                for event
+                in candidate[
+                    "events"
+                ]
             ]
         )
 
-        if not np.isfinite(recent_success):
-
-            recent_success = (
-                success * 100.0
-            )
-
-        recent_success /= 100.0
-
-        return (
-            sim * 0.40
-            + occurrence * 0.15
-            + success * 0.15
-            + cycle_stability * 0.15
-            + recent_success * 0.15
+        candidate[
+            "max_ups"
+        ] = finite_values(
+            [
+                event[
+                    "max_up"
+                ]
+                for event
+                in candidate[
+                    "events"
+                ]
+            ]
         )
 
-    driver_candidates.sort(
-        key=candidate_score,
-        reverse=True,
-    )
+        candidate[
+            "max_downs"
+        ] = finite_values(
+            [
+                event[
+                    "max_down"
+                ]
+                for event
+                in candidate[
+                    "events"
+                ]
+            ]
+        )
 
     # ========================================================
-    # Duplicate Suppression
+    # Candidate filtering
     # ========================================================
+
+    # 검증되지 않은 단순 duplicate 제거
+    candidates.sort(
+        key=lambda item: (
+            -safe_float(
+                item["score"],
+                0,
+            ),
+
+            -safe_float(
+                item[
+                    "current_similarity"
+                ],
+                0,
+            ),
+
+            -item[
+                "occurrences"
+            ],
+
+            -safe_float(
+                item[
+                    "cycle_stability"
+                ],
+                0,
+            ),
+        )
+    )
 
     selected = []
 
-    max_allowed = min(
-        allowed_driver_count(
-            history_length
-        ),
-        MAX_DRIVERS,
-    )
+    for candidate in candidates:
 
-    for candidate in driver_candidates:
+        if is_duplicate_driver(
+            candidate,
+            selected,
+        ):
 
-        if len(selected) >= max_allowed:
+            continue
+
+        selected.append(
+            candidate
+        )
+
+        if len(selected) >= (
+            MAX_DRIVERS
+        ):
+
             break
 
-        duplicate = False
-
-        for existing in selected:
-
-            same_base = (
-                candidate["base_cluster_id"]
-                == existing["base_cluster_id"]
-            )
-
-            same_cycle = (
-                candidate["cycle_type"]
-                == existing["cycle_type"]
-            )
-
-            if same_base and same_cycle:
-
-                duplicate = True
-                break
-
-            candidate_centroid = (
-                candidate["cluster"]
-                .get("centroid")
-            )
-
-            existing_centroid = (
-                existing["cluster"]
-                .get("centroid")
-            )
-
-            if (
-                candidate_centroid is None
-                or existing_centroid is None
-            ):
-                continue
-
-            sim = cosine_similarity(
-                candidate_centroid,
-                existing_centroid,
-            )
-
-            if sim >= 0.97:
-
-                c1 = safe_float(
-                    candidate["cycle_mode"]
-                )
-
-                c2 = safe_float(
-                    existing["cycle_mode"]
-                )
-
-                if (
-                    np.isfinite(c1)
-                    and np.isfinite(c2)
-                ):
-
-                    ratio = (
-                        max(c1, c2)
-                        / max(
-                            min(c1, c2),
-                            1,
-                        )
-                    )
-
-                    if ratio < 1.35:
-
-                        duplicate = True
-                        break
-
-        if not duplicate:
-            selected.append(candidate)
-
     if not selected:
-        return [], [], []
+
+        return (
+            [],
+            [],
+            [],
+        )
+
+    # ========================================================
+    # Driver rank
+    # ========================================================
 
     profiles = []
     current_rows = []
     history_rows = []
-
-    # ========================================================
-    # Driver Rank
-    # ========================================================
 
     for rank, item in enumerate(
         selected,
         start=1,
     ):
 
-        cluster_events = (
-            item["cluster"]["events"]
+        cluster_events_list = (
+            item[
+                "cluster"
+            ][
+                "events"
+            ]
         )
 
         driver_name = (
             f"DRIVER_{rank}"
         )
 
-        pattern = item["pattern"]
-
-        cycle_type = item["cycle_type"]
-
         display_pattern = (
-            f"[{cycle_type}] "
-            f"{pattern}"
+            f"[{item['cycle_type']}] "
+            f"{item['pattern']}"
         )
 
-        item["driver_rank"] = rank
-        item["driver_name"] = driver_name
-        item["display_pattern"] = display_pattern
+        item[
+            "driver_rank"
+        ] = rank
 
-        forward_returns = item[
-            "forward_returns"
-        ]
+        item[
+            "driver_name"
+        ] = driver_name
 
-        max_ups = item[
-            "max_ups"
-        ]
-
-        max_downs = item[
-            "max_downs"
-        ]
+        item[
+            "display_pattern"
+        ] = display_pattern
 
         profile = {
 
@@ -3729,39 +3905,61 @@ def analyze_symbol(symbol):
                 driver_name,
 
             "cluster_id":
-                item["cluster_id"],
+                item[
+                    "cluster_id"
+                ],
 
             "base_cluster_id":
-                item["base_cluster_id"],
+                item[
+                    "base_cluster_id"
+                ],
 
             "pattern":
                 display_pattern,
 
             "cycle_type":
-                cycle_type,
+                item[
+                    "cycle_type"
+                ],
 
             "cycle_mode_days":
                 rnd(
-                    item["cycle_mode"],
+                    item[
+                        "cycle_mode"
+                    ],
                     1,
                 ),
 
             "cycle_stability_pct":
                 pct(
-                    item["cycle_stability"]
+                    item[
+                        "cycle_stability"
+                    ]
                 ),
 
+            "cycle_observations":
+                item[
+                    "cycle_observations"
+                ],
+
             "state":
-                item["state"],
+                item[
+                    "state"
+                ],
 
             "validation_status":
-                item["validation_status"],
+                item[
+                    "validation_status"
+                ],
 
             "phase":
                 phase,
 
+            "current_pattern":
+                current_pattern,
+
             "history_days":
-                history_length,
+                len(df),
 
             "current_price":
                 rnd(
@@ -3777,240 +3975,317 @@ def analyze_symbol(symbol):
                     2,
                 ),
 
+            "driver_score_pct":
+                rnd(
+                    item[
+                        "score"
+                    ] * 100,
+                    2,
+                ),
+
             "occurrences":
-                item["occurrences"],
+                item[
+                    "occurrences"
+                ],
 
             "success_count":
-                item["success_count"],
+                item[
+                    "success_count"
+                ],
 
             "success_rate_pct":
                 pct(
-                    item["success_rate"]
+                    item[
+                        "success_rate"
+                    ]
                 ),
 
             "plus5_first_count":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "plus5_first_count"
                 ],
 
             "plus5_first_rate_pct":
                 pct(
-                    item["ordered"][
+                    item[
+                        "ordered"
+                    ][
                         "plus5_first_rate"
                     ]
                 ),
 
             "plus5_valid_n":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "plus5_valid_n"
                 ],
 
             "plus10_first_count":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "plus10_first_count"
                 ],
 
             "plus10_first_rate_pct":
                 pct(
-                    item["ordered"][
+                    item[
+                        "ordered"
+                    ][
                         "plus10_first_rate"
                     ]
                 ),
 
             "plus10_valid_n":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "plus10_valid_n"
                 ],
 
             "plus20_first_count":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "plus20_first_count"
                 ],
 
             "plus20_first_rate_pct":
                 pct(
-                    item["ordered"][
+                    item[
+                        "ordered"
+                    ][
                         "plus20_first_rate"
                     ]
                 ),
 
             "plus20_valid_n":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "plus20_valid_n"
                 ],
 
             "minus5_first_count":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "minus5_first_count"
                 ],
 
             "minus5_first_rate_pct":
                 pct(
-                    item["ordered"][
+                    item[
+                        "ordered"
+                    ][
                         "minus5_first_rate"
                     ]
                 ),
 
             "minus5_valid_n":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "minus5_valid_n"
                 ],
 
             "ambiguous_count":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "ambiguous_count"
                 ],
 
             "no_hit_count":
-                item["ordered"][
+                item[
+                    "ordered"
+                ][
                     "no_hit_count"
                 ],
 
             "recent_occurrences":
-                item["recent"][
+                item[
+                    "recent"
+                ][
                     "recent_occurrences"
                 ],
 
             "recent_plus5_first_pct":
-                item["recent"][
+                item[
+                    "recent"
+                ][
                     "recent_plus5_first_pct"
                 ],
 
             "recent_plus10_first_pct":
-                item["recent"][
+                item[
+                    "recent"
+                ][
                     "recent_plus10_first_pct"
                 ],
 
             "recent_plus20_first_pct":
-                item["recent"][
+                item[
+                    "recent"
+                ][
                     "recent_plus20_first_pct"
                 ],
 
             "recent_minus5_first_pct":
-                item["recent"][
+                item[
+                    "recent"
+                ][
                     "recent_minus5_first_pct"
                 ],
 
             "avg_forward_return_pct":
                 rnd(
-                    forward_returns.mean()
+                    item[
+                        "forward_returns"
+                    ].mean()
                     * 100
-                    if not forward_returns.empty
+                    if not item[
+                        "forward_returns"
+                    ].empty
                     else np.nan,
                     2,
                 ),
 
             "median_forward_return_pct":
                 rnd(
-                    forward_returns.median()
+                    item[
+                        "forward_returns"
+                    ].median()
                     * 100
-                    if not forward_returns.empty
+                    if not item[
+                        "forward_returns"
+                    ].empty
                     else np.nan,
                     2,
                 ),
 
             "median_max_up_pct":
                 rnd(
-                    max_ups.median()
+                    item[
+                        "max_ups"
+                    ].median()
                     * 100
-                    if not max_ups.empty
+                    if not item[
+                        "max_ups"
+                    ].empty
                     else np.nan,
                     2,
                 ),
 
             "median_max_down_pct":
                 rnd(
-                    max_downs.median()
+                    item[
+                        "max_downs"
+                    ].median()
                     * 100
-                    if not max_downs.empty
+                    if not item[
+                        "max_downs"
+                    ].empty
                     else np.nan,
                     2,
                 ),
 
-            "median_cycle_days":
-                rnd(
-                    item["cycle_mode"],
-                    1,
-                ),
-
             "mean_cycle_days":
                 rnd(
-                    item["cycle_mean"],
+                    item[
+                        "cycle_mean"
+                    ],
                     1,
                 ),
 
             "cycle_std_days":
                 rnd(
-                    item["cycle_std"],
+                    item[
+                        "cycle_std"
+                    ],
                     1,
                 ),
 
-            "cycle_observations":
-                item["cycle_observations"],
-
             "target1":
                 rnd(
-                    item["target1"],
+                    item[
+                        "target1"
+                    ],
                     4,
                 ),
 
             "target2":
                 rnd(
-                    item["target2"],
+                    item[
+                        "target2"
+                    ],
                     4,
                 ),
 
             "invalidation":
                 rnd(
-                    item["invalidation"],
+                    item[
+                        "invalidation"
+                    ],
                     4,
                 ),
 
             "first_seen":
                 min(
-                    pd.Timestamp(
+                    date_string(
                         event["date"]
                     )
-                    .date()
-                    .isoformat()
-                    for event in cluster_events
+                    for event
+                    in cluster_events_list
                 ),
 
             "last_seen":
                 max(
-                    pd.Timestamp(
+                    date_string(
                         event["date"]
                     )
-                    .date()
-                    .isoformat()
-                    for event in cluster_events
+                    for event
+                    in cluster_events_list
                 ),
         }
 
-        profiles.append(profile)
+        profiles.append(
+            profile
+        )
 
         # ----------------------------------------------------
-        # History
+        # HISTORY
         # ----------------------------------------------------
 
-        for event in cluster_events:
+        for event in cluster_events_list:
 
             history_rows.append(
                 make_history_row(
                     symbol,
                     rank,
                     driver_name,
-                    item["cluster_id"],
+                    item[
+                        "cluster_id"
+                    ],
                     display_pattern,
-                    cycle_type,
-                    item["cycle_mode"],
+                    item[
+                        "cycle_type"
+                    ],
+                    item[
+                        "cycle_mode"
+                    ],
                     event,
-                    item["base_cluster_id"],
+                    item[
+                        "base_cluster_id"
+                    ],
                 )
             )
 
     # ========================================================
-    # Current Driver
+    # CURRENT DRIVER
     # ========================================================
 
     if profiles:
@@ -4019,95 +4294,164 @@ def analyze_symbol(symbol):
 
         current_rows.append(
             {
+
                 "symbol":
                     symbol,
 
                 "as_of":
-                    usable.index[-1]
-                    .date()
-                    .isoformat(),
+                    date_string(
+                        df.index[-1]
+                    ),
 
                 "current_price":
-                    top["current_price"],
+                    top[
+                        "current_price"
+                    ],
 
                 "active_driver":
-                    top["driver_name"],
+                    top[
+                        "driver_name"
+                    ],
 
                 "cluster_id":
-                    top["cluster_id"],
+                    top[
+                        "cluster_id"
+                    ],
 
                 "base_cluster_id":
-                    top["base_cluster_id"],
+                    top[
+                        "base_cluster_id"
+                    ],
 
                 "pattern":
-                    top["pattern"],
+                    top[
+                        "pattern"
+                    ],
 
                 "cycle_type":
-                    top["cycle_type"],
+                    top[
+                        "cycle_type"
+                    ],
 
                 "cycle_mode_days":
-                    top["cycle_mode_days"],
+                    top[
+                        "cycle_mode_days"
+                    ],
 
                 "cycle_stability_pct":
-                    top["cycle_stability_pct"],
+                    top[
+                        "cycle_stability_pct"
+                    ],
+
+                "cycle_observations":
+                    top[
+                        "cycle_observations"
+                    ],
 
                 "state":
-                    top["state"],
+                    top[
+                        "state"
+                    ],
 
                 "validation_status":
-                    top["validation_status"],
+                    top[
+                        "validation_status"
+                    ],
 
                 "phase":
-                    top["phase"],
+                    top[
+                        "phase"
+                    ],
+
+                "current_pattern":
+                    top[
+                        "current_pattern"
+                    ],
 
                 "similarity_pct":
-                    top["current_similarity_pct"],
+                    top[
+                        "current_similarity_pct"
+                    ],
+
+                "driver_score_pct":
+                    top[
+                        "driver_score_pct"
+                    ],
 
                 "success_rate_pct":
-                    top["success_rate_pct"],
+                    top[
+                        "success_rate_pct"
+                    ],
 
                 "plus5_first_pct":
-                    top["plus5_first_rate_pct"],
+                    top[
+                        "plus5_first_rate_pct"
+                    ],
 
                 "plus10_first_pct":
-                    top["plus10_first_rate_pct"],
+                    top[
+                        "plus10_first_rate_pct"
+                    ],
 
                 "plus20_first_pct":
-                    top["plus20_first_rate_pct"],
+                    top[
+                        "plus20_first_rate_pct"
+                    ],
 
                 "minus5_first_pct":
-                    top["minus5_first_rate_pct"],
+                    top[
+                        "minus5_first_rate_pct"
+                    ],
 
                 "recent_plus5_first_pct":
-                    top["recent_plus5_first_pct"],
+                    top[
+                        "recent_plus5_first_pct"
+                    ],
 
                 "recent_plus10_first_pct":
-                    top["recent_plus10_first_pct"],
+                    top[
+                        "recent_plus10_first_pct"
+                    ],
 
                 "recent_plus20_first_pct":
-                    top["recent_plus20_first_pct"],
+                    top[
+                        "recent_plus20_first_pct"
+                    ],
 
                 "recent_minus5_first_pct":
-                    top["recent_minus5_first_pct"],
+                    top[
+                        "recent_minus5_first_pct"
+                    ],
 
                 "target1":
-                    top["target1"],
+                    top[
+                        "target1"
+                    ],
 
                 "target2":
-                    top["target2"],
+                    top[
+                        "target2"
+                    ],
 
                 "invalidation":
-                    top["invalidation"],
+                    top[
+                        "invalidation"
+                    ],
 
                 "occurrences":
-                    top["occurrences"],
+                    top[
+                        "occurrences"
+                    ],
 
                 "cycle_status":
                     (
                         "VALIDATED"
-                        if top[
-                            "cycle_observations"
-                        ] >= 2
+                        if (
+                            top[
+                                "cycle_observations"
+                            ]
+                            >= MIN_CYCLE_OBSERVATIONS
+                        )
                         else
                         "INSUFFICIENT_REPEAT"
                     ),
@@ -4115,12 +4459,12 @@ def analyze_symbol(symbol):
         )
 
     # ========================================================
-    # Console
+    # CONSOLE
     # ========================================================
 
     print(
         f"[OK] {symbol}: "
-        f"history={history_length} "
+        f"history={len(df)} "
         f"events={len(events)} "
         f"drivers={len(profiles)} "
         f"phase={phase} "
@@ -4141,7 +4485,9 @@ def analyze_symbol(symbol):
             f"-5first={safe_float(profile['minus5_first_rate_pct']):.1f}% | "
             f"cycle={safe_float(profile['cycle_mode_days']):.1f}d | "
             f"cycle_stab={safe_float(profile['cycle_stability_pct']):.1f}% | "
+            f"cycle_obs={profile['cycle_observations']} | "
             f"occ={profile['occurrences']} | "
+            f"score={safe_float(profile['driver_score_pct']):.1f}% | "
             f"validation={profile['validation_status']} | "
             f"T1={safe_float(profile['target1']):.2f} | "
             f"T2={safe_float(profile['target2']):.2f} | "
@@ -4185,7 +4531,8 @@ def load_symbols_from_project():
         return list(
             dict.fromkeys(
                 value.strip().upper()
-                for value in env_symbols.split(",")
+                for value
+                in env_symbols.split(",")
                 if value.strip()
             )
         )
@@ -4329,7 +4676,7 @@ def run(symbols):
     )
 
     print(
-        " UNIVERSAL DRIVER ENGINE v6.1"
+        " UNIVERSAL DRIVER ENGINE v6.2"
     )
 
     print(
@@ -4381,7 +4728,19 @@ def run(symbols):
     )
 
     print(
+        f"harmonic_tolerance     : {HARMONIC_TOLERANCE}"
+    )
+
+    print(
+        f"max_cycle_multiple     : {MAX_CYCLE_MULTIPLE}"
+    )
+
+    print(
         f"min_driver_occurrences : {MIN_DRIVER_OCCURRENCES}"
+    )
+
+    print(
+        f"min_cycle_observations : {MIN_CYCLE_OBSERVATIONS}"
     )
 
     print(
@@ -4405,7 +4764,9 @@ def run(symbols):
         try:
 
             profiles, current, history = (
-                analyze_symbol(symbol)
+                analyze_symbol(
+                    symbol
+                )
             )
 
             all_profiles.extend(
@@ -4469,4 +4830,3 @@ if __name__ == "__main__":
     )
 
     run(symbols)
-
