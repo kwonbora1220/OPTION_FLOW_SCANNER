@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-UNIVERSAL DRIVER ENGINE v6.2.1
-==============================
+UNIVERSAL DRIVER ENGINE v6.3
+============================
 
 종목별 과거 OHLCV에서 반복되는 "운전수(Driver)"를 탐색한다.
 
-v6.2.1 핵심
------------
+v6.3 핵심
+---------
 1. 미래 FORWARD일이 완전히 존재하는 역사 이벤트만 학습
 2. Pattern Cluster + Cycle Cluster 구조 유지
 3. 인접 이벤트 gap을 cycle의 1차 근거로 사용
@@ -17,15 +17,23 @@ v6.2.1 핵심
 6. 3개 이벤트 미만에서는 cycle 검증 금지
 7. 서로 다른 cycle 배수는 같은 Driver로 통합
 8. 구조적으로 다른 pattern/signature만 별도 Driver
-9. cycle base를 "최소 harmonic base" 기준으로 정규화
+9. cycle base를 최소 harmonic base 기준으로 정규화
 10. 최근 재현성 계산
 11. cycle stability 계산
 12. 현재 similarity와 historical reproducibility 분리
-13. MAX_DRIVERS는 상한일 뿐 3개를 강제로 만들지 않음
-14. 낮은 cycle stability Driver 제외
-15. 현재 similarity가 낮은 Driver 제외
-16. +5 / +10 / +20 / -5 ordered outcome 유지
-17. look-ahead bias 방지
+13. cycle 반복과 가격 결과 반복을 분리
+14. 결과 재현성(result reproducibility) 계산
+15. 최근 결과 재현성 별도 계산
+16. AMBIGUOUS / NO_HIT 분리
+17. 표본 수가 적은 Driver의 성공률 과대평가 방지
+18. 최근 발생일 / 다음 예상 cycle 계산
+19. cycle phase 계산
+20. Driver 중복 제거 강화
+21. MAX_DRIVERS는 상한일 뿐 3개를 강제로 만들지 않음
+22. 낮은 cycle stability Driver 제외
+23. 낮은 현재 similarity Driver 제외
+24. +5 / +10 / +20 / -5 ordered outcome 유지
+25. look-ahead bias 방지
 
 출력
 -----
@@ -53,6 +61,7 @@ OUTPUT_DIR = Path("03_RESULTS/daily")
 PROFILE_FILE = OUTPUT_DIR / "driver_profile.csv"
 CURRENT_FILE = OUTPUT_DIR / "driver_current.csv"
 HISTORY_FILE = OUTPUT_DIR / "driver_history.csv"
+
 
 LOOKBACK_PERIOD = os.getenv(
     "DRIVER_LOOKBACK",
@@ -119,13 +128,6 @@ CYCLE_MIN_DAYS = int(
     os.getenv(
         "DRIVER_CYCLE_MIN_DAYS",
         "25",
-    )
-)
-
-CYCLE_TOLERANCE = float(
-    os.getenv(
-        "DRIVER_CYCLE_TOLERANCE",
-        "0.30",
     )
 )
 
@@ -199,6 +201,39 @@ DUPLICATE_CYCLE_RATIO = float(
     )
 )
 
+# 결과 재현성 최소 기준.
+# cycle이 반복돼도 결과가 반복되지 않으면 강한 Driver로 보지 않는다.
+MIN_RESULT_REPRODUCIBILITY = float(
+    os.getenv(
+        "DRIVER_MIN_RESULT_REPRO",
+        "0.45",
+    )
+)
+
+# 최근 결과 재현성이 이 값보다 낮으면 품질을 낮춘다.
+MIN_RECENT_REPRODUCIBILITY = float(
+    os.getenv(
+        "DRIVER_MIN_RECENT_REPRO",
+        "0.40",
+    )
+)
+
+# 결과 재현성 계산에서 최소 resolved 표본.
+MIN_RESOLVED_RESULTS = int(
+    os.getenv(
+        "DRIVER_MIN_RESOLVED_RESULTS",
+        "2",
+    )
+)
+
+# 너무 가까운 이벤트가 하나의 패턴을 과도하게 대표하는 것을 방지.
+RESULT_LOOKBACK = int(
+    os.getenv(
+        "DRIVER_RESULT_LOOKBACK",
+        "5",
+    )
+)
+
 
 # ============================================================
 # BASIC HELPERS
@@ -207,24 +242,31 @@ DUPLICATE_CYCLE_RATIO = float(
 def safe_float(value, default=np.nan):
     try:
         value = float(value)
+
         if np.isfinite(value):
             return value
+
     except Exception:
         pass
+
     return default
 
 
 def rnd(value, digits=2):
     value = safe_float(value)
+
     if not np.isfinite(value):
         return np.nan
+
     return round(value, digits)
 
 
 def pct(value, digits=2):
     value = safe_float(value)
+
     if not np.isfinite(value):
         return np.nan
+
     return round(value * 100.0, digits)
 
 
@@ -277,6 +319,21 @@ def date_string(value):
         return str(value)
 
 
+def clamp01(value, default=0.0):
+    value = safe_float(value, default)
+
+    if not np.isfinite(value):
+        return default
+
+    return float(
+        np.clip(
+            value,
+            0.0,
+            1.0,
+        )
+    )
+
+
 # ============================================================
 # DATA DOWNLOAD
 # ============================================================
@@ -308,7 +365,9 @@ def clean_download(df):
                     break
 
             flattened.append(
-                found if found else str(column[0])
+                found
+                if found
+                else str(column[0])
             )
 
         out.columns = flattened
@@ -320,18 +379,25 @@ def clean_download(df):
 
         if name == "open":
             rename[column] = "Open"
+
         elif name == "high":
             rename[column] = "High"
+
         elif name == "low":
             rename[column] = "Low"
+
         elif name == "close":
             rename[column] = "Close"
+
         elif name == "adj close":
             rename[column] = "Adj Close"
+
         elif name == "volume":
             rename[column] = "Volume"
 
-    out = out.rename(columns=rename)
+    out = out.rename(
+        columns=rename
+    )
 
     required = [
         "Open",
@@ -427,7 +493,10 @@ def add_features(df):
 
     x["atr_pct"] = (
         x["atr14"]
-        / close.replace(0, np.nan)
+        / close.replace(
+            0,
+            np.nan,
+        )
     )
 
     x["vol20"] = (
@@ -439,7 +508,10 @@ def add_features(df):
         volume
         .rolling(20)
         .median()
-        .replace(0, np.nan)
+        .replace(
+            0,
+            np.nan,
+        )
     )
 
     x["vol_ratio"] = (
@@ -574,7 +646,8 @@ def robust_zscore(values):
     )
 
     return (
-        filled - median
+        filled
+        - median
     ) / (
         1.4826 * mad
     )
@@ -592,7 +665,9 @@ def safe_interpolate(values, length):
             length,
         )
 
-    series = pd.Series(array)
+    series = pd.Series(
+        array
+    )
 
     return (
         series
@@ -1169,42 +1244,51 @@ def ordered_outcome(
     return {
         "first_event": first_event,
         "first_day": first_day,
+
         "plus5_first": positive_first(
             first_plus5,
             first_minus5,
         ),
+
         "plus10_first": positive_first(
             first_plus10,
             first_minus5,
         ),
+
         "plus20_first": positive_first(
             first_plus20,
             first_minus5,
         ),
+
         "minus5_first": negative_first(
             first_minus5,
             first_plus5,
         ),
+
         "days_to_plus5": (
             first_plus5
             if first_plus5 is not None
             else np.nan
         ),
+
         "days_to_plus10": (
             first_plus10
             if first_plus10 is not None
             else np.nan
         ),
+
         "days_to_plus20": (
             first_plus20
             if first_plus20 is not None
             else np.nan
         ),
+
         "days_to_minus5": (
             first_minus5
             if first_minus5 is not None
             else np.nan
         ),
+
         "outcome_status": outcome_status,
     }
 
@@ -1341,18 +1425,14 @@ def build_event(
         "price": close,
         "pattern": pattern,
         "signature": signature,
-        "forward_return": future[
-            "forward_return"
-        ],
-        "max_up": future[
-            "max_up"
-        ],
-        "max_down": future[
-            "max_down"
-        ],
-        "ordered": future[
-            "ordered"
-        ],
+        "forward_return":
+            future["forward_return"],
+        "max_up":
+            future["max_up"],
+        "max_down":
+            future["max_down"],
+        "ordered":
+            future["ordered"],
     }
 
 
@@ -1440,13 +1520,12 @@ def cluster_events(events):
         if best_cluster is None:
             clusters.append(
                 {
-                    "pattern": event[
-                        "pattern"
-                    ],
-                    "events": [event],
-                    "centroid": event[
-                        "signature"
-                    ].copy(),
+                    "pattern":
+                        event["pattern"],
+                    "events":
+                        [event],
+                    "centroid":
+                        event["signature"].copy(),
                 }
             )
 
@@ -1483,7 +1562,7 @@ def cluster_events(events):
 
 
 # ============================================================
-# CYCLE ENGINE v6.2.1
+# CYCLE ENGINE
 # ============================================================
 
 def adjacent_gaps(events):
@@ -1492,7 +1571,8 @@ def adjacent_gaps(events):
 
     ordered = sorted(
         events,
-        key=lambda event: pd.Timestamp(
+        key=lambda event:
+        pd.Timestamp(
             event["date"]
         ),
     )
@@ -1515,13 +1595,12 @@ def adjacent_gaps(events):
         if gap >= CYCLE_MIN_DAYS:
             result.append(
                 {
-                    "gap": float(gap),
-                    "from_date": previous[
-                        "date"
-                    ],
-                    "to_date": current[
-                        "date"
-                    ],
+                    "gap":
+                        float(gap),
+                    "from_date":
+                        previous["date"],
+                    "to_date":
+                        current["date"],
                 }
             )
 
@@ -1534,7 +1613,8 @@ def pairwise_gaps(events):
 
     ordered = sorted(
         events,
-        key=lambda event: pd.Timestamp(
+        key=lambda event:
+        pd.Timestamp(
             event["date"]
         ),
     )
@@ -1626,44 +1706,7 @@ def fits_harmonic(
     )
 
 
-def normalized_cycle_values(
-    gaps,
-    base,
-):
-    result = []
-
-    for gap in gaps:
-        multiple, error = nearest_harmonic(
-            gap,
-            base,
-        )
-
-        if multiple is None:
-            continue
-
-        if error <= HARMONIC_TOLERANCE:
-            result.append(
-                float(gap / multiple)
-            )
-
-    return result
-
-
 def candidate_cycle_bases(gaps):
-    """
-    핵심 변경.
-
-    예:
-        58, 116, 174
-
-    기존:
-        58 / 116 / 174가 모두 후보가 될 수 있음.
-
-    v6.2.1:
-        harmonic normalization을 통해
-        58 근처를 대표 base로 우선 선택한다.
-    """
-
     clean = sorted(
         {
             float(round(gap))
@@ -1691,10 +1734,15 @@ def candidate_cycle_bases(gaps):
 
             if base >= CYCLE_MIN_DAYS:
                 candidates.add(
-                    round(base, 1)
+                    round(
+                        base,
+                        1,
+                    )
                 )
 
-    return sorted(candidates)
+    return sorted(
+        candidates
+    )
 
 
 def cycle_candidate_score(
@@ -1720,7 +1768,10 @@ def cycle_candidate_score(
             multiple is not None
             and error <= HARMONIC_TOLERANCE
         ):
-            matched_adjacent.append(gap)
+            matched_adjacent.append(
+                gap
+            )
+
             normalized.append(
                 gap / multiple
             )
@@ -1746,13 +1797,21 @@ def cycle_candidate_score(
 
     if normalized:
         center = float(
-            np.median(normalized)
+            np.median(
+                normalized
+            )
         )
 
         errors = [
-            abs(value - center)
-            / max(center, 1.0)
-            for value in normalized
+            abs(
+                value - center
+            )
+            / max(
+                center,
+                1.0,
+            )
+            for value
+            in normalized
         ]
 
         mean_error = float(
@@ -1763,49 +1822,43 @@ def cycle_candidate_score(
         center = np.nan
         mean_error = 999.0
 
-    # 인접 gap이 압도적으로 중요하다.
     score = (
         adjacent_support * 100.0
         + pairwise_support * 0.50
         - mean_error * 20.0
     )
 
-    # 같은 지지력을 가진 경우
-    # 더 작은 harmonic base를 선호한다.
-    # 단, 지나치게 작은 base는 별도 후보가 될 수 있으므로
-    # CYCLE_MIN_DAYS 아래는 이미 제외.
     return {
-        "base": float(base),
-        "score": float(score),
+        "base":
+            float(base),
+
+        "score":
+            float(score),
+
         "adjacent_support":
             adjacent_support,
+
         "pairwise_support":
             pairwise_support,
+
         "matched_adjacent":
             matched_adjacent,
+
         "matched_pairwise":
             matched_pairwise,
+
         "normalized":
             normalized,
+
         "mean_error":
             mean_error,
+
         "center":
             center,
     }
 
 
 def select_cycle_base(events):
-    """
-    cycle 검증 규칙
-
-    이벤트 3개
-      -> adjacent gap 2개
-      -> cycle observation 2개
-
-    따라서 이벤트 2개만으로는
-    절대 cycle validated가 되지 않는다.
-    """
-
     adjacent = adjacent_gaps(
         events
     )
@@ -1814,13 +1867,17 @@ def select_cycle_base(events):
         events
     )
 
-    if len(adjacent) < MIN_CYCLE_OBSERVATIONS:
+    if (
+        len(adjacent)
+        < MIN_CYCLE_OBSERVATIONS
+    ):
         return {
             "valid": False,
             "reason":
                 "INSUFFICIENT_ADJACENT_GAPS",
             "base": np.nan,
-            "observations": len(adjacent),
+            "observations":
+                len(adjacent),
             "stability": np.nan,
             "mean": np.nan,
             "std": np.nan,
@@ -1862,25 +1919,6 @@ def select_cycle_base(events):
             )
         )
 
-    # --------------------------------------------------------
-    # 중요한 선택 기준
-    #
-    # 1. adjacent support
-    # 2. mean harmonic error
-    # 3. pairwise support
-    # 4. 작은 base
-    #
-    # 이렇게 해야
-    #
-    # 58 / 116 / 174
-    #
-    # 에서
-    #
-    # 58-day base
-    #
-    # 를 하나의 cycle로 잡는다.
-    # --------------------------------------------------------
-
     scored.sort(
         key=lambda item: (
             -item[
@@ -1904,20 +1942,28 @@ def select_cycle_base(events):
         "normalized"
     ]
 
-    observations = len(matched)
+    observations = len(
+        matched
+    )
 
     if observations >= 2:
         median_cycle = float(
-            np.median(matched)
+            np.median(
+                matched
+            )
         )
 
         deviations = [
-            abs(value - median_cycle)
+            abs(
+                value
+                - median_cycle
+            )
             / max(
                 median_cycle,
                 1.0,
             )
-            for value in matched
+            for value
+            in matched
         ]
 
         stability = max(
@@ -1947,38 +1993,66 @@ def select_cycle_base(events):
     )
 
     return {
-        "valid": bool(valid),
+        "valid":
+            bool(valid),
+
         "reason": (
             "VALID"
             if valid
             else
             "INSUFFICIENT_RECURRENCE"
         ),
+
         "base": (
-            float(median_cycle)
+            float(
+                median_cycle
+            )
             if np.isfinite(
                 median_cycle
             )
             else np.nan
         ),
+
         "observations":
             int(observations),
+
         "stability":
             float(stability),
+
         "mean":
-            safe_mean(matched),
+            safe_mean(
+                matched
+            ),
+
         "std":
-            safe_std(matched),
+            safe_std(
+                matched
+            ),
+
         "adjacent":
             adjacent,
+
         "pairwise":
             pairwise,
+
         "matched":
             matched,
+
+        "matched_adjacent":
+            best[
+                "matched_adjacent"
+            ],
+
+        "mean_error":
+            best[
+                "mean_error"
+            ],
     }
 
 
-def classify_cycle(cycle_result):
+def classify_cycle(
+    cycle_result
+):
     base = safe_float(
         cycle_result.get(
             "base"
@@ -1998,34 +2072,13 @@ def classify_cycle(cycle_result):
 
 
 # ============================================================
-# EVENT GROUP
+# CYCLE GROUP
 # ============================================================
 
 def cycle_group_events(
     events,
     cycle_result,
 ):
-    """
-    v6.2.1에서는 cycle이 검증된 경우
-    같은 pattern cluster 안의 harmonic cycle을
-    하나의 Driver로 묶는다.
-
-    즉:
-
-        58
-        116
-        174
-
-    를
-
-        DRIVER A / cycle 58d
-
-    하나로 유지한다.
-
-    과거 v6.2처럼 여러 sequence로 잘라
-    같은 운전수를 여러 Driver로 만드는 것을 방지한다.
-    """
-
     if not events:
         return []
 
@@ -2051,17 +2104,20 @@ def cycle_group_events(
     if (
         not np.isfinite(base)
         or base <= 0
-        or observations < MIN_CYCLE_OBSERVATIONS
+        or observations
+        < MIN_CYCLE_OBSERVATIONS
         or (
             np.isfinite(stability)
-            and stability < MIN_CYCLE_STABILITY
+            and stability
+            < MIN_CYCLE_STABILITY
         )
     ):
         return []
 
     ordered = sorted(
         events,
-        key=lambda event: pd.Timestamp(
+        key=lambda event:
+        pd.Timestamp(
             event["date"]
         ),
     )
@@ -2070,7 +2126,10 @@ def cycle_group_events(
         ordered
     )
 
-    if len(gaps) < MIN_CYCLE_OBSERVATIONS:
+    if (
+        len(gaps)
+        < MIN_CYCLE_OBSERVATIONS
+    ):
         return []
 
     matched_count = 0
@@ -2082,7 +2141,10 @@ def cycle_group_events(
         ):
             matched_count += 1
 
-    if matched_count < MIN_CYCLE_OBSERVATIONS:
+    if (
+        matched_count
+        < MIN_CYCLE_OBSERVATIONS
+    ):
         return []
 
     return [
@@ -2112,7 +2174,9 @@ def calculate_ordered_stats(events):
     success_count = 0
 
     for event in events:
-        ordered = event["ordered"]
+        ordered = event[
+            "ordered"
+        ]
 
         status = ordered[
             "outcome_status"
@@ -2128,7 +2192,9 @@ def calculate_ordered_stats(events):
             resolved += 1
 
         value = safe_float(
-            ordered["plus5_first"]
+            ordered[
+                "plus5_first"
+            ]
         )
 
         if np.isfinite(value):
@@ -2138,7 +2204,9 @@ def calculate_ordered_stats(events):
                 first_plus5 += 1
 
         value = safe_float(
-            ordered["plus10_first"]
+            ordered[
+                "plus10_first"
+            ]
         )
 
         if np.isfinite(value):
@@ -2148,7 +2216,9 @@ def calculate_ordered_stats(events):
                 first_plus10 += 1
 
         value = safe_float(
-            ordered["plus20_first"]
+            ordered[
+                "plus20_first"
+            ]
         )
 
         if np.isfinite(value):
@@ -2158,7 +2228,9 @@ def calculate_ordered_stats(events):
                 first_plus20 += 1
 
         value = safe_float(
-            ordered["minus5_first"]
+            ordered[
+                "minus5_first"
+            ]
         )
 
         if np.isfinite(value):
@@ -2168,7 +2240,9 @@ def calculate_ordered_stats(events):
                 first_minus5 += 1
 
         if (
-            ordered["first_event"]
+            ordered[
+                "first_event"
+            ]
             == "PLUS_5"
         ):
             success_count += 1
@@ -2176,41 +2250,216 @@ def calculate_ordered_stats(events):
     return {
         "plus5_valid_n":
             len(plus5),
+
         "plus10_valid_n":
             len(plus10),
+
         "plus20_valid_n":
             len(plus20),
+
         "minus5_valid_n":
             len(minus5),
+
         "plus5_first_count":
             first_plus5,
+
         "plus10_first_count":
             first_plus10,
+
         "plus20_first_count":
             first_plus20,
+
         "minus5_first_count":
             first_minus5,
+
         "plus5_first_rate":
             safe_mean(plus5),
+
         "plus10_first_rate":
             safe_mean(plus10),
+
         "plus20_first_rate":
             safe_mean(plus20),
+
         "minus5_first_rate":
             safe_mean(minus5),
+
         "ambiguous_count":
             ambiguous,
+
         "no_hit_count":
             no_hit,
+
         "resolved_count":
             resolved,
+
         "success_count":
             success_count,
+
         "success_rate": (
             success_count / resolved
             if resolved > 0
             else np.nan
         ),
+    }
+
+
+# ============================================================
+# RESULT REPRODUCIBILITY
+# ============================================================
+
+def result_reproducibility(events):
+    """
+    cycle이 반복되는 것과 실제 결과가 반복되는 것은 다르다.
+
+    이 함수는 Driver가 발생했을 때
+    실제로 +5% 방향 결과가 반복됐는지를 계산한다.
+
+    resolved 결과만 별도 계산하며,
+    AMBIGUOUS / NO_HIT은 성공으로 취급하지 않는다.
+    """
+
+    if not events:
+        return {
+            "result_reproducibility":
+                np.nan,
+            "resolved_rate":
+                np.nan,
+            "ambiguous_rate":
+                np.nan,
+            "no_hit_rate":
+                np.nan,
+            "resolved_n":
+                0,
+            "positive_n":
+                0,
+            "negative_n":
+                0,
+        }
+
+    resolved_events = []
+    ambiguous = 0
+    no_hit = 0
+
+    for event in events:
+        first_event = event[
+            "ordered"
+        ]["first_event"]
+
+        if first_event == "PLUS_5":
+            resolved_events.append(
+                1.0
+            )
+
+        elif first_event == "MINUS_5":
+            resolved_events.append(
+                0.0
+            )
+
+        elif first_event == "AMBIGUOUS":
+            ambiguous += 1
+
+        else:
+            no_hit += 1
+
+    total = len(events)
+
+    resolved_n = len(
+        resolved_events
+    )
+
+    positive_n = int(
+        sum(
+            value == 1.0
+            for value
+            in resolved_events
+        )
+    )
+
+    negative_n = (
+        resolved_n
+        - positive_n
+    )
+
+    if resolved_n > 0:
+        raw_repro = (
+            positive_n
+            / resolved_n
+        )
+
+        resolved_rate = (
+            resolved_n
+            / total
+        )
+
+    else:
+        raw_repro = np.nan
+        resolved_rate = 0.0
+
+    ambiguous_rate = (
+        ambiguous / total
+        if total
+        else np.nan
+    )
+
+    no_hit_rate = (
+        no_hit / total
+        if total
+        else np.nan
+    )
+
+    # --------------------------------------------------------
+    # 표본 보정
+    #
+    # 3/3 = 100%라고 바로 강한 Driver로 판단하지 않는다.
+    #
+    # resolved 표본이 증가할수록 보정값이 원래 값에 접근.
+    # --------------------------------------------------------
+
+    if resolved_n > 0:
+        confidence = (
+            resolved_n
+            / (
+                resolved_n
+                + 2.0
+            )
+        )
+
+        baseline = 0.50
+
+        adjusted = (
+            raw_repro * confidence
+            + baseline
+            * (1.0 - confidence)
+        )
+
+    else:
+        adjusted = np.nan
+
+    return {
+        "result_reproducibility":
+            adjusted,
+
+        "raw_result_reproducibility":
+            raw_repro,
+
+        "resolved_rate":
+            resolved_rate,
+
+        "ambiguous_rate":
+            ambiguous_rate,
+
+        "no_hit_rate":
+            no_hit_rate,
+
+        "resolved_n":
+            resolved_n,
+
+        "positive_n":
+            positive_n,
+
+        "negative_n":
+            negative_n,
     }
 
 
@@ -2221,16 +2470,30 @@ def calculate_ordered_stats(events):
 def recent_statistics(events):
     if not events:
         return {
-            "recent_occurrences": 0,
-            "recent_plus5_first_pct": np.nan,
-            "recent_plus10_first_pct": np.nan,
-            "recent_plus20_first_pct": np.nan,
-            "recent_minus5_first_pct": np.nan,
+            "recent_occurrences":
+                0,
+            "recent_plus5_first_pct":
+                np.nan,
+            "recent_plus10_first_pct":
+                np.nan,
+            "recent_plus20_first_pct":
+                np.nan,
+            "recent_minus5_first_pct":
+                np.nan,
+            "recent_result_reproducibility_pct":
+                np.nan,
+            "recent_resolved_rate_pct":
+                np.nan,
+            "recent_ambiguous_rate_pct":
+                np.nan,
+            "recent_no_hit_rate_pct":
+                np.nan,
         }
 
     ordered = sorted(
         events,
-        key=lambda event: pd.Timestamp(
+        key=lambda event:
+        pd.Timestamp(
             event["date"]
         ),
     )
@@ -2243,33 +2506,157 @@ def recent_statistics(events):
         recent
     )
 
+    repro = result_reproducibility(
+        recent
+    )
+
     return {
         "recent_occurrences":
             len(recent),
+
         "recent_plus5_first_pct":
             pct(
                 stats[
                     "plus5_first_rate"
                 ]
             ),
+
         "recent_plus10_first_pct":
             pct(
                 stats[
                     "plus10_first_rate"
                 ]
             ),
+
         "recent_plus20_first_pct":
             pct(
                 stats[
                     "plus20_first_rate"
                 ]
             ),
+
         "recent_minus5_first_pct":
             pct(
                 stats[
                     "minus5_first_rate"
                 ]
             ),
+
+        "recent_result_reproducibility_pct":
+            pct(
+                repro[
+                    "result_reproducibility"
+                ]
+            ),
+
+        "recent_resolved_rate_pct":
+            pct(
+                repro[
+                    "resolved_rate"
+                ]
+            ),
+
+        "recent_ambiguous_rate_pct":
+            pct(
+                repro[
+                    "ambiguous_rate"
+                ]
+            ),
+
+        "recent_no_hit_rate_pct":
+            pct(
+                repro[
+                    "no_hit_rate"
+                ]
+            ),
+    }
+
+
+# ============================================================
+# CYCLE TIMING
+# ============================================================
+
+def calculate_cycle_timing(
+    events,
+    cycle_mode,
+    as_of,
+):
+    if not events:
+        return {
+            "days_since_last_occurrence":
+                np.nan,
+            "expected_next_cycle":
+                np.nan,
+            "cycle_phase_pct":
+                np.nan,
+        }
+
+    ordered = sorted(
+        events,
+        key=lambda event:
+        pd.Timestamp(
+            event["date"]
+        ),
+    )
+
+    last_date = pd.Timestamp(
+        ordered[-1]["date"]
+    )
+
+    current_date = pd.Timestamp(
+        as_of
+    )
+
+    days_since = (
+        current_date
+        - last_date
+    ).days
+
+    cycle = safe_float(
+        cycle_mode
+    )
+
+    if (
+        not np.isfinite(cycle)
+        or cycle <= 0
+    ):
+        return {
+            "days_since_last_occurrence":
+                days_since,
+            "expected_next_cycle":
+                np.nan,
+            "cycle_phase_pct":
+                np.nan,
+        }
+
+    expected_next = (
+        last_date
+        + pd.Timedelta(
+            days=float(cycle)
+        )
+    )
+
+    phase = (
+        days_since
+        / cycle
+    )
+
+    # phase는 표시용으로 0~200% 정도까지 허용.
+    phase_pct = (
+        phase * 100.0
+    )
+
+    return {
+        "days_since_last_occurrence":
+            days_since,
+
+        "expected_next_cycle":
+            date_string(
+                expected_next
+            ),
+
+        "cycle_phase_pct":
+            phase_pct,
     }
 
 
@@ -2308,8 +2695,13 @@ def calculate_targets(
     )
 
     if ups.empty:
-        target1 = current_price * 1.05
-        target2 = current_price * 1.10
+        target1 = (
+            current_price * 1.05
+        )
+
+        target2 = (
+            current_price * 1.10
+        )
 
     else:
         median_up = float(
@@ -2387,11 +2779,20 @@ def validation_status(
     occurrences,
     cycle_observations,
     cycle_stability,
+    result_repro,
+    resolved_n,
+    recent_repro,
 ):
-    if occurrences < MIN_DRIVER_OCCURRENCES:
+    if (
+        occurrences
+        < MIN_DRIVER_OCCURRENCES
+    ):
         return "INSUFFICIENT_OCCURRENCES"
 
-    if cycle_observations < MIN_CYCLE_OBSERVATIONS:
+    if (
+        cycle_observations
+        < MIN_CYCLE_OBSERVATIONS
+    ):
         return "LOW_CYCLE_REPEAT"
 
     if (
@@ -2405,10 +2806,48 @@ def validation_status(
     ):
         return "LOW_CYCLE_STABILITY"
 
-    if occurrences < VALIDATED_OCCURRENCES:
+    # 결과 표본이 아직 너무 적으면
+    # cycle 자체는 반복돼도 결과 Driver로는
+    # REPEAT_DETECTED까지만 허용.
+    if (
+        resolved_n
+        < MIN_RESOLVED_RESULTS
+    ):
+        return "LOW_RESULT_SAMPLE"
+
+    if (
+        np.isfinite(
+            safe_float(
+                result_repro
+            )
+        )
+        and result_repro
+        < MIN_RESULT_REPRODUCIBILITY
+    ):
+        return "LOW_RESULT_REPRO"
+
+    if (
+        np.isfinite(
+            safe_float(
+                recent_repro
+            )
+        )
+        and recent_repro
+        < MIN_RECENT_REPRODUCIBILITY
+        and occurrences >= VALIDATED_OCCURRENCES
+    ):
+        return "RECENT_RESULT_WEAK"
+
+    if (
+        occurrences
+        < VALIDATED_OCCURRENCES
+    ):
         return "REPEAT_DETECTED"
 
-    if occurrences < STABLE_OCCURRENCES:
+    if (
+        occurrences
+        < STABLE_OCCURRENCES
+    ):
         return "VALIDATED"
 
     return "STABLE"
@@ -2422,26 +2861,84 @@ def driver_state(
         current_similarity
     )
 
-    if validation in {
+    weak_validation = {
         "INSUFFICIENT_OCCURRENCES",
         "LOW_CYCLE_REPEAT",
         "LOW_CYCLE_STABILITY",
-    }:
+        "LOW_RESULT_SAMPLE",
+        "LOW_RESULT_REPRO",
+    }
+
+    if validation in weak_validation:
         return "PROVISIONAL"
 
     if (
         np.isfinite(similarity)
-        and similarity >= CURRENT_ACTIVE_SIM
+        and similarity
+        >= CURRENT_ACTIVE_SIM
     ):
         return "ACTIVE"
 
     if (
         np.isfinite(similarity)
-        and similarity >= CURRENT_WATCH_SIM
+        and similarity
+        >= CURRENT_WATCH_SIM
     ):
         return "WATCH"
 
     return "INACTIVE"
+
+
+# ============================================================
+# DRIVER QUALITY
+# ============================================================
+
+def driver_quality(
+    occurrences,
+    cycle_stability,
+    result_repro,
+    recent_repro,
+    current_similarity,
+):
+    """
+    0~100 품질.
+
+    중요:
+    이것은 방향성 추천 점수가 아니다.
+    Driver 자체가 얼마나 재현 가능한 구조인지 보는 품질값이다.
+    """
+
+    sim = clamp01(
+        current_similarity
+    )
+
+    cycle = clamp01(
+        cycle_stability
+    )
+
+    repro = clamp01(
+        result_repro
+    )
+
+    recent = clamp01(
+        recent_repro
+    )
+
+    occurrence = clamp01(
+        occurrences / 8.0
+    )
+
+    quality = (
+        sim * 0.20
+        + cycle * 0.20
+        + repro * 0.30
+        + recent * 0.20
+        + occurrence * 0.10
+    )
+
+    return float(
+        quality
+    )
 
 
 # ============================================================
@@ -2454,56 +2951,49 @@ def driver_score(
     plus5_first_rate,
     cycle_stability,
     recent_plus5,
+    result_repro,
+    recent_repro,
 ):
-    def clamp(
-        value,
-        default=0.0,
-    ):
-        value = safe_float(
-            value,
-            default,
-        )
-
-        if not np.isfinite(value):
-            return default
-
-        return float(
-            np.clip(
-                value,
-                0,
-                1,
-            )
-        )
-
-    sim = clamp(
+    sim = clamp01(
         current_similarity
     )
 
-    occurrence_score = clamp(
+    occurrence_score = clamp01(
         min(
             occurrences / 8.0,
             1.0,
         )
     )
 
-    plus5 = clamp(
+    plus5 = clamp01(
         plus5_first_rate
     )
 
-    cycle = clamp(
+    cycle = clamp01(
         cycle_stability
     )
 
-    recent = clamp(
+    recent = clamp01(
         recent_plus5
     )
 
+    repro = clamp01(
+        result_repro
+    )
+
+    recent_repro_value = clamp01(
+        recent_repro
+    )
+
+    # v6.2.1보다 결과 재현성을 더 중요하게 둔다.
     score = (
-        sim * 0.30
-        + occurrence_score * 0.15
-        + plus5 * 0.20
-        + cycle * 0.20
-        + recent * 0.15
+        sim * 0.20
+        + occurrence_score * 0.10
+        + plus5 * 0.15
+        + cycle * 0.15
+        + recent * 0.10
+        + repro * 0.20
+        + recent_repro_value * 0.10
     )
 
     return float(
@@ -2514,6 +3004,50 @@ def driver_score(
 # ============================================================
 # DUPLICATE DRIVER
 # ============================================================
+
+def cycle_ratio_is_harmonic(
+    c1,
+    c2,
+):
+    if (
+        not np.isfinite(c1)
+        or not np.isfinite(c2)
+        or c1 <= 0
+        or c2 <= 0
+    ):
+        return False
+
+    ratio = (
+        max(c1, c2)
+        / min(c1, c2)
+    )
+
+    nearest = round(
+        ratio
+    )
+
+    if (
+        nearest < 1
+        or nearest
+        > MAX_CYCLE_MULTIPLE
+    ):
+        return False
+
+    error = (
+        abs(
+            ratio - nearest
+        )
+        / max(
+            nearest,
+            1,
+        )
+    )
+
+    return (
+        error
+        <= HARMONIC_TOLERANCE
+    )
+
 
 def is_duplicate_driver(
     candidate,
@@ -2544,6 +3078,8 @@ def is_duplicate_driver(
             ]
         )
 
+        # 동일 cycle 또는 harmonic cycle이면
+        # 같은 구조로 간주.
         if (
             np.isfinite(c1)
             and np.isfinite(c2)
@@ -2556,33 +3092,15 @@ def is_duplicate_driver(
                 )
             )
 
-            # 같은 구조 + harmonic cycle이면
-            # 동일 Driver로 취급.
-            if ratio <= DUPLICATE_CYCLE_RATIO:
+            if (
+                ratio
+                <= DUPLICATE_CYCLE_RATIO
+            ):
                 return True
 
-            # 1x/2x/3x 관계도 같은 Driver.
-            multiple = (
-                max(c1, c2)
-                / min(c1, c2)
-            )
-
-            nearest = round(
-                multiple
-            )
-
-            if (
-                nearest
-                <= MAX_CYCLE_MULTIPLE
-                and abs(
-                    multiple
-                    - nearest
-                )
-                / max(
-                    nearest,
-                    1,
-                )
-                <= HARMONIC_TOLERANCE
+            if cycle_ratio_is_harmonic(
+                c1,
+                c2,
             ):
                 return True
 
@@ -2618,7 +3136,9 @@ def make_base_cluster_id(
     )
 
     digest = hashlib.sha1(
-        raw.encode("utf-8")
+        raw.encode(
+            "utf-8"
+        )
     ).hexdigest()[:10]
 
     return (
@@ -2638,7 +3158,9 @@ def make_cluster_id(
     )
 
     digest = hashlib.sha1(
-        raw.encode("utf-8")
+        raw.encode(
+            "utf-8"
+        )
     ).hexdigest()[:10]
 
     return (
@@ -2663,65 +3185,127 @@ def make_history_row(
     event,
     base_cluster_id,
 ):
-    ordered = event["ordered"]
+    ordered = event[
+        "ordered"
+    ]
 
     return {
-        "symbol": symbol,
-        "driver_rank": rank,
-        "driver_name": driver_name,
-        "cluster_id": cluster_id,
+        "symbol":
+            symbol,
+
+        "driver_rank":
+            rank,
+
+        "driver_name":
+            driver_name,
+
+        "cluster_id":
+            cluster_id,
+
         "base_cluster_id":
             base_cluster_id,
-        "date": date_string(
-            event["date"]
-        ),
-        "price": rnd(
-            event["price"],
-            4,
-        ),
-        "pattern": pattern,
-        "cycle_type": cycle_type,
-        "cycle_mode_days": rnd(
-            cycle_mode,
-            1,
-        ),
-        "forward_return_pct": rnd(
-            event["forward_return"]
-            * 100,
-            2,
-        ),
-        "max_up_pct": rnd(
-            event["max_up"]
-            * 100,
-            2,
-        ),
-        "max_down_pct": rnd(
-            event["max_down"]
-            * 100,
-            2,
-        ),
+
+        "date":
+            date_string(
+                event["date"]
+            ),
+
+        "price":
+            rnd(
+                event["price"],
+                4,
+            ),
+
+        "pattern":
+            pattern,
+
+        "cycle_type":
+            cycle_type,
+
+        "cycle_mode_days":
+            rnd(
+                cycle_mode,
+                1,
+            ),
+
+        "forward_return_pct":
+            rnd(
+                event[
+                    "forward_return"
+                ] * 100,
+                2,
+            ),
+
+        "max_up_pct":
+            rnd(
+                event[
+                    "max_up"
+                ] * 100,
+                2,
+            ),
+
+        "max_down_pct":
+            rnd(
+                event[
+                    "max_down"
+                ] * 100,
+                2,
+            ),
+
         "first_event":
-            ordered["first_event"],
+            ordered[
+                "first_event"
+            ],
+
         "first_day":
-            ordered["first_day"],
+            ordered[
+                "first_day"
+            ],
+
         "plus5_first":
-            ordered["plus5_first"],
+            ordered[
+                "plus5_first"
+            ],
+
         "plus10_first":
-            ordered["plus10_first"],
+            ordered[
+                "plus10_first"
+            ],
+
         "plus20_first":
-            ordered["plus20_first"],
+            ordered[
+                "plus20_first"
+            ],
+
         "minus5_first":
-            ordered["minus5_first"],
+            ordered[
+                "minus5_first"
+            ],
+
         "days_to_plus5":
-            ordered["days_to_plus5"],
+            ordered[
+                "days_to_plus5"
+            ],
+
         "days_to_plus10":
-            ordered["days_to_plus10"],
+            ordered[
+                "days_to_plus10"
+            ],
+
         "days_to_plus20":
-            ordered["days_to_plus20"],
+            ordered[
+                "days_to_plus20"
+            ],
+
         "days_to_minus5":
-            ordered["days_to_minus5"],
+            ordered[
+                "days_to_minus5"
+            ],
+
         "outcome_status":
-            ordered["outcome_status"],
+            ordered[
+                "outcome_status"
+            ],
     }
 
 
@@ -2822,6 +3406,12 @@ def analyze_symbol(symbol):
 
     candidates = []
 
+    current_price = safe_float(
+        df["Close"].iloc[-1]
+    )
+
+    as_of = df.index[-1]
+
     # ========================================================
     # BUILD CANDIDATES
     # ========================================================
@@ -2859,13 +3449,6 @@ def analyze_symbol(symbol):
             )
         )
 
-        # ----------------------------------------------------
-        # cycle이 검증되지 않으면 Driver 후보 제외.
-        #
-        # 이렇게 해야 단순히 3번 비슷하게 발생했다는 이유로
-        # "운전수"라고 부르는 것을 방지한다.
-        # ----------------------------------------------------
-
         if not cycle_result.get(
             "valid",
             False,
@@ -2895,8 +3478,6 @@ def analyze_symbol(symbol):
         if not grouped:
             continue
 
-        # v6.2.1에서는 검증된 cycle pattern cluster를
-        # 하나의 Driver로 유지한다.
         event_group = grouped[0]
 
         if len(event_group) < (
@@ -2933,40 +3514,6 @@ def analyze_symbol(symbol):
             centroid,
         )
 
-        stats = calculate_ordered_stats(
-            event_group
-        )
-
-        recent = recent_statistics(
-            event_group
-        )
-
-        recent_plus5_pct = safe_float(
-            recent.get(
-                "recent_plus5_first_pct",
-                np.nan,
-            )
-        )
-
-        if np.isfinite(
-            recent_plus5_pct
-        ):
-            recent_plus5_rate = (
-                recent_plus5_pct / 100.0
-            )
-        else:
-            recent_plus5_rate = np.nan
-
-        validation = validation_status(
-            len(event_group),
-            cycle_observations,
-            cycle_stability,
-        )
-
-        # ----------------------------------------------------
-        # 현재 유사도 기준
-        # ----------------------------------------------------
-
         if (
             not np.isfinite(
                 current_similarity
@@ -2976,6 +3523,54 @@ def analyze_symbol(symbol):
         ):
             continue
 
+        stats = calculate_ordered_stats(
+            event_group
+        )
+
+        recent = recent_statistics(
+            event_group
+        )
+
+        repro = result_reproducibility(
+            event_group
+        )
+
+        result_repro = safe_float(
+            repro.get(
+                "result_reproducibility"
+            )
+        )
+
+        recent_repro = safe_float(
+            recent.get(
+                "recent_result_reproducibility_pct"
+            )
+        )
+
+        if np.isfinite(
+            recent_repro
+        ):
+            recent_repro_rate = (
+                recent_repro / 100.0
+            )
+
+        else:
+            recent_repro_rate = np.nan
+
+        validation = validation_status(
+            len(event_group),
+            cycle_observations,
+            cycle_stability,
+            result_repro,
+            int(
+                repro.get(
+                    "resolved_n",
+                    0,
+                )
+            ),
+            recent_repro_rate,
+        )
+
         score = driver_score(
             current_similarity,
             len(event_group),
@@ -2983,7 +3578,25 @@ def analyze_symbol(symbol):
                 "plus5_first_rate"
             ],
             cycle_stability,
-            recent_plus5_rate,
+            (
+                safe_float(
+                    recent.get(
+                        "recent_plus5_first_pct",
+                        np.nan,
+                    )
+                ) / 100.0
+                if np.isfinite(
+                    safe_float(
+                        recent.get(
+                            "recent_plus5_first_pct",
+                            np.nan,
+                        )
+                    )
+                )
+                else np.nan
+            ),
+            result_repro,
+            recent_repro_rate,
         )
 
         state = driver_state(
@@ -2991,17 +3604,29 @@ def analyze_symbol(symbol):
             validation,
         )
 
+        quality = driver_quality(
+            len(event_group),
+            cycle_stability,
+            result_repro,
+            recent_repro_rate,
+            current_similarity,
+        )
+
         target1, target2, invalidation = (
             calculate_targets(
-                safe_float(
-                    df["Close"].iloc[-1]
-                ),
+                current_price,
                 event_group,
             )
         )
 
         cycle_type = classify_cycle(
             cycle_result
+        )
+
+        timing = calculate_cycle_timing(
+            event_group,
+            cycle_mode,
+            as_of,
         )
 
         base_cluster_id = (
@@ -3022,50 +3647,85 @@ def analyze_symbol(symbol):
             {
                 "events":
                     event_group,
+
                 "pattern":
                     cluster["pattern"],
+
                 "centroid":
                     centroid,
+
                 "current_similarity":
                     current_similarity,
+
                 "occurrences":
                     len(event_group),
+
                 "cycle_type":
                     cycle_type,
+
                 "cycle_mode":
                     cycle_mode,
+
                 "cycle_observations":
                     cycle_observations,
+
                 "cycle_stability":
                     cycle_stability,
+
                 "cycle_mean":
                     cycle_result.get(
                         "mean",
                         np.nan,
                     ),
+
                 "cycle_std":
                     cycle_result.get(
                         "std",
                         np.nan,
                     ),
+
                 "ordered":
                     stats,
+
                 "recent":
                     recent,
+
+                "repro":
+                    repro,
+
+                "result_repro":
+                    result_repro,
+
+                "recent_repro":
+                    recent_repro_rate,
+
+                "timing":
+                    timing,
+
                 "validation":
                     validation,
+
                 "state":
                     state,
+
+                "quality":
+                    quality,
+
                 "score":
                     score,
+
                 "target1":
                     target1,
+
                 "target2":
                     target2,
+
                 "invalidation":
                     invalidation,
+
                 "base_cluster_id":
                     base_cluster_id,
+
                 "cluster_id":
                     cluster_id,
             }
@@ -3081,13 +3741,26 @@ def analyze_symbol(symbol):
                 item["score"],
                 0,
             ),
+
+            -safe_float(
+                item["quality"],
+                0,
+            ),
+
             -safe_float(
                 item["current_similarity"],
                 0,
             ),
+
             -int(
                 item["occurrences"]
             ),
+
+            -safe_float(
+                item["result_repro"],
+                0,
+            ),
+
             -safe_float(
                 item["cycle_stability"],
                 0,
@@ -3122,10 +3795,6 @@ def analyze_symbol(symbol):
     profiles = []
     current_rows = []
     history_rows = []
-
-    current_price = safe_float(
-        df["Close"].iloc[-1]
-    )
 
     current_pattern = choose_pattern_label(
         df.iloc[-WINDOW:]
@@ -3175,6 +3844,14 @@ def analyze_symbol(symbol):
 
         recent = item[
             "recent"
+        ]
+
+        repro = item[
+            "repro"
+        ]
+
+        timing = item[
+            "timing"
         ]
 
         profile = {
@@ -3266,6 +3943,13 @@ def analyze_symbol(symbol):
                     ]
                 ),
 
+            "driver_quality_pct":
+                pct(
+                    item[
+                        "quality"
+                    ]
+                ),
+
             "state":
                 item[
                     "state"
@@ -3283,6 +3967,71 @@ def analyze_symbol(symbol):
                 item[
                     "occurrences"
                 ],
+
+            # --------------------------------------------
+            # 전체 결과 재현성
+            # --------------------------------------------
+
+            "result_reproducibility_pct":
+                pct(
+                    item[
+                        "result_repro"
+                    ]
+                ),
+
+            "raw_result_reproducibility_pct":
+                pct(
+                    repro.get(
+                        "raw_result_reproducibility",
+                        np.nan,
+                    )
+                ),
+
+            "resolved_rate_pct":
+                pct(
+                    repro.get(
+                        "resolved_rate",
+                        np.nan,
+                    )
+                ),
+
+            "ambiguous_rate_pct":
+                pct(
+                    repro.get(
+                        "ambiguous_rate",
+                        np.nan,
+                    )
+                ),
+
+            "no_hit_rate_pct":
+                pct(
+                    repro.get(
+                        "no_hit_rate",
+                        np.nan,
+                    )
+                ),
+
+            "resolved_n":
+                repro.get(
+                    "resolved_n",
+                    0,
+                ),
+
+            "positive_n":
+                repro.get(
+                    "positive_n",
+                    0,
+                ),
+
+            "negative_n":
+                repro.get(
+                    "negative_n",
+                    0,
+                ),
+
+            # --------------------------------------------
+            # +5 / +10 / +20 / -5
+            # --------------------------------------------
 
             "success_rate_pct":
                 pct(
@@ -3369,6 +4118,10 @@ def analyze_symbol(symbol):
                     "no_hit_count"
                 ],
 
+            # --------------------------------------------
+            # 최근 재현
+            # --------------------------------------------
+
             "recent_occurrences":
                 recent[
                     "recent_occurrences"
@@ -3394,6 +4147,52 @@ def analyze_symbol(symbol):
                     "recent_minus5_first_pct"
                 ],
 
+            "recent_result_reproducibility_pct":
+                recent[
+                    "recent_result_reproducibility_pct"
+                ],
+
+            "recent_resolved_rate_pct":
+                recent[
+                    "recent_resolved_rate_pct"
+                ],
+
+            "recent_ambiguous_rate_pct":
+                recent[
+                    "recent_ambiguous_rate_pct"
+                ],
+
+            "recent_no_hit_rate_pct":
+                recent[
+                    "recent_no_hit_rate_pct"
+                ],
+
+            # --------------------------------------------
+            # cycle timing
+            # --------------------------------------------
+
+            "days_since_last_occurrence":
+                timing[
+                    "days_since_last_occurrence"
+                ],
+
+            "expected_next_cycle":
+                timing[
+                    "expected_next_cycle"
+                ],
+
+            "cycle_phase_pct":
+                rnd(
+                    timing[
+                        "cycle_phase_pct"
+                    ],
+                    1,
+                ),
+
+            # --------------------------------------------
+            # future statistics
+            # --------------------------------------------
+
             "avg_forward_return_pct":
                 rnd(
                     safe_mean(
@@ -3404,8 +4203,7 @@ def analyze_symbol(symbol):
                             for event
                             in item["events"]
                         ]
-                    )
-                    * 100,
+                    ) * 100,
                     2,
                 ),
 
@@ -3419,8 +4217,7 @@ def analyze_symbol(symbol):
                             for event
                             in item["events"]
                         ]
-                    )
-                    * 100,
+                    ) * 100,
                     2,
                 ),
 
@@ -3434,8 +4231,7 @@ def analyze_symbol(symbol):
                             for event
                             in item["events"]
                         ]
-                    )
-                    * 100,
+                    ) * 100,
                     2,
                 ),
 
@@ -3449,8 +4245,7 @@ def analyze_symbol(symbol):
                             for event
                             in item["events"]
                         ]
-                    )
-                    * 100,
+                    ) * 100,
                     2,
                 ),
 
@@ -3535,8 +4330,9 @@ def analyze_symbol(symbol):
     active_profiles = [
         profile
         for profile in profiles
-        if profile["state"]
-        in {
+        if profile[
+            "state"
+        ] in {
             "ACTIVE",
             "WATCH",
         }
@@ -3630,9 +4426,34 @@ def analyze_symbol(symbol):
                         "driver_score_pct"
                     ],
 
+                "driver_quality_pct":
+                    top[
+                        "driver_quality_pct"
+                    ],
+
                 "success_rate_pct":
                     top[
                         "success_rate_pct"
+                    ],
+
+                "result_reproducibility_pct":
+                    top[
+                        "result_reproducibility_pct"
+                    ],
+
+                "resolved_rate_pct":
+                    top[
+                        "resolved_rate_pct"
+                    ],
+
+                "ambiguous_rate_pct":
+                    top[
+                        "ambiguous_rate_pct"
+                    ],
+
+                "no_hit_rate_pct":
+                    top[
+                        "no_hit_rate_pct"
                     ],
 
                 "plus5_first_pct":
@@ -3673,6 +4494,26 @@ def analyze_symbol(symbol):
                 "recent_minus5_first_pct":
                     top[
                         "recent_minus5_first_pct"
+                    ],
+
+                "recent_result_reproducibility_pct":
+                    top[
+                        "recent_result_reproducibility_pct"
+                    ],
+
+                "days_since_last_occurrence":
+                    top[
+                        "days_since_last_occurrence"
+                    ],
+
+                "expected_next_cycle":
+                    top[
+                        "expected_next_cycle"
+                    ],
+
+                "cycle_phase_pct":
+                    top[
+                        "cycle_phase_pct"
                     ],
 
                 "target1":
@@ -3734,10 +4575,13 @@ def analyze_symbol(symbol):
             f"+10first={safe_float(profile['plus10_first_rate_pct']):.1f}% | "
             f"+20first={safe_float(profile['plus20_first_rate_pct']):.1f}% | "
             f"-5first={safe_float(profile['minus5_first_rate_pct']):.1f}% | "
+            f"result_repro={safe_float(profile['result_reproducibility_pct']):.1f}% | "
+            f"recent_repro={safe_float(profile['recent_result_reproducibility_pct']):.1f}% | "
             f"cycle={safe_float(profile['cycle_mode_days']):.1f}d | "
             f"cycle_stab={safe_float(profile['cycle_stability_pct']):.1f}% | "
             f"cycle_obs={profile['cycle_observations']} | "
             f"occ={profile['occurrences']} | "
+            f"quality={safe_float(profile['driver_quality_pct']):.1f}% | "
             f"score={safe_float(profile['driver_score_pct']):.1f}% | "
             f"validation={profile['validation_status']} | "
             f"T1={safe_float(profile['target1']):.2f} | "
@@ -3792,7 +4636,8 @@ def load_symbols_from_project():
 
         symbols = [
             str(value).strip().upper()
-            for value in SELECTED_SYMBOLS
+            for value
+            in SELECTED_SYMBOLS
             if str(value).strip()
         ]
 
@@ -3920,7 +4765,7 @@ def run(symbols):
     )
 
     print(
-        " UNIVERSAL DRIVER ENGINE v6.2.1"
+        " UNIVERSAL DRIVER ENGINE v6.3"
     )
 
     print(
@@ -3964,11 +4809,13 @@ def run(symbols):
     )
 
     print(
-        f"harmonic_tolerance      : {HARMONIC_TOLERANCE}"
+        f"harmonic_tolerance      : "
+        f"{HARMONIC_TOLERANCE}"
     )
 
     print(
-        f"max_cycle_multiple      : {MAX_CYCLE_MULTIPLE}"
+        f"max_cycle_multiple      : "
+        f"{MAX_CYCLE_MULTIPLE}"
     )
 
     print(
@@ -3984,6 +4831,21 @@ def run(symbols):
     print(
         f"min_cycle_stability     : "
         f"{MIN_CYCLE_STABILITY}"
+    )
+
+    print(
+        f"min_result_repro        : "
+        f"{MIN_RESULT_REPRODUCIBILITY}"
+    )
+
+    print(
+        f"min_recent_repro        : "
+        f"{MIN_RECENT_REPRODUCIBILITY}"
+    )
+
+    print(
+        f"min_resolved_results    : "
+        f"{MIN_RESOLVED_RESULTS}"
     )
 
     print(
@@ -4057,6 +4919,11 @@ def run(symbols):
             "[WARN] "
             "No current Driver detected."
         )
+
+    print()
+    print(
+        "===== DRIVER ENGINE END ====="
+    )
 
 
 # ============================================================
