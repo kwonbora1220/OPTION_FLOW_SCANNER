@@ -135,6 +135,7 @@ def format_signed_money(x):
     return format_money(x)
 
 
+
 # ============================================================
 # MARKET PRICE
 # ============================================================
@@ -151,41 +152,187 @@ def get_market_price_context(ticker):
 
             t = yf.Ticker(ticker)
 
-            hist = t.history(
-                period="5d",
-                interval="1d",
-                auto_adjust=False
-            )
+            # ====================================================
+            # 1. Yahoo QUOTE 정보
+            #
+            # POST 상태에서는
+            # regularMarketPreviousClose
+            # = 마지막 정규장 종가
+            #
+            # regularMarketPrice
+            # = 현재 시장가격/시간외 가격
+            # ====================================================
 
-            regular_close = None
-
-            if not hist.empty:
-
-                close = hist["Close"].dropna()
-
-                if not close.empty:
-                    regular_close = float(
-                        close.iloc[-1]
-                    )
-
-            if regular_close is None:
-                raise ValueError(
-                    "정규장 종가를 가져오지 못했습니다."
-                )
-
-            market_state = None
+            info = {}
 
             try:
 
                 info = t.get_info()
 
-                market_state = info.get(
-                    "marketState"
+            except Exception as e:
+
+                print(
+                    f"⚠️ Yahoo quote 정보 조회 실패: {e}"
                 )
+
+            market_state = info.get(
+                "marketState"
+            )
+
+            quote_regular_close = None
+
+            try:
+
+                value = info.get(
+                    "regularMarketPreviousClose"
+                )
+
+                if value is not None:
+
+                    quote_regular_close = float(
+                        value
+                    )
 
             except Exception:
 
-                market_state = None
+                quote_regular_close = None
+
+
+            quote_market_price = None
+
+            try:
+
+                value = info.get(
+                    "regularMarketPrice"
+                )
+
+                if value is not None:
+
+                    quote_market_price = float(
+                        value
+                    )
+
+            except Exception:
+
+                quote_market_price = None
+
+
+            # ====================================================
+            # 2. DAILY HISTORY
+            #
+            # 검증용으로 사용한다.
+            # 단, 이것만 믿지 않는다.
+            # ====================================================
+
+            hist = t.history(
+                period="5d",
+                interval="1d",
+                auto_adjust=False,
+                prepost=False
+            )
+
+            history_close = None
+            history_date = None
+
+            if not hist.empty:
+
+                hist = hist.dropna(
+                    subset=["Close"]
+                )
+
+                if not hist.empty:
+
+                    last_row = hist.iloc[-1]
+
+                    history_close = float(
+                        last_row["Close"]
+                    )
+
+                    history_index = (
+                        hist.index[-1]
+                    )
+
+                    try:
+
+                        if (
+                            getattr(
+                                history_index,
+                                "tzinfo",
+                                None
+                            )
+                            is not None
+                        ):
+
+                            history_date = (
+                                history_index
+                                .tz_convert(
+                                    "America/New_York"
+                                )
+                                .date()
+                            )
+
+                        else:
+
+                            history_date = (
+                                history_index.date()
+                            )
+
+                    except Exception:
+
+                        history_date = None
+
+
+            # ====================================================
+            # 3. 정규장 종가 결정
+            #
+            # POST / PRE 상태에서는
+            # regularMarketPreviousClose를 우선한다.
+            #
+            # 이것이 이번 CRCL 문제를 해결하는 핵심.
+            # ====================================================
+
+            regular_close = None
+
+            regular_close_source = None
+
+            if (
+                quote_regular_close is not None
+                and quote_regular_close > 0
+            ):
+
+                regular_close = (
+                    quote_regular_close
+                )
+
+                regular_close_source = (
+                    "Yahoo regularMarketPreviousClose"
+                )
+
+            elif (
+                history_close is not None
+                and history_close > 0
+            ):
+
+                regular_close = (
+                    history_close
+                )
+
+                regular_close_source = (
+                    "Yahoo daily history fallback"
+                )
+
+            if regular_close is None:
+
+                raise ValueError(
+                    "정규장 종가를 가져오지 못했습니다."
+                )
+
+
+            # ====================================================
+            # 4. 시간외 가격
+            #
+            # 기존 1분 prepost 데이터도 유지한다.
+            # ====================================================
 
             after_hours_price = None
 
@@ -216,10 +363,13 @@ def get_market_price_context(ticker):
                             "POSTPOST"
                         }:
 
-                            if abs(
-                                latest_price
-                                - regular_close
-                            ) > 0.000001:
+                            if (
+                                abs(
+                                    latest_price
+                                    - regular_close
+                                )
+                                > 0.000001
+                            ):
 
                                 after_hours_price = (
                                     latest_price
@@ -230,6 +380,42 @@ def get_market_price_context(ticker):
                 print(
                     f"⚠️ 시간외 가격 조회 실패: {e}"
                 )
+
+
+            # ====================================================
+            # 5. fallback
+            #
+            # 1분 데이터가 실패했지만
+            # Yahoo quote의 regularMarketPrice가
+            # 정규장 종가와 다르면 시간외 가격으로 사용.
+            # ====================================================
+
+            if (
+                after_hours_price is None
+                and market_state in {
+                    "POST",
+                    "POSTPOST"
+                }
+                and quote_market_price is not None
+                and regular_close != 0
+            ):
+
+                if (
+                    abs(
+                        quote_market_price
+                        - regular_close
+                    )
+                    > 0.000001
+                ):
+
+                    after_hours_price = (
+                        quote_market_price
+                    )
+
+
+            # ====================================================
+            # 6. AH 변화율
+            # ====================================================
 
             after_hours_change_pct = None
 
@@ -245,10 +431,44 @@ def get_market_price_context(ticker):
                     ) - 1
                 ) * 100
 
+
+            # ====================================================
+            # 7. PRICE DATE
+            #
+            # daily history 날짜는 참고용.
+            # 실제 정규장 종가 source를 함께 출력한다.
+            # ====================================================
+
+            us_market_date = (
+                datetime.now(
+                    ZoneInfo(
+                        "America/New_York"
+                    )
+                ).date()
+            )
+
+
             print(
                 f"💰 {ticker} 정규장 종가: "
                 f"${regular_close:.2f}"
             )
+
+            print(
+                f"📅 {ticker} 가격 조회 ET 날짜: "
+                f"{us_market_date}"
+            )
+
+            print(
+                f"📌 {ticker} 가격 source: "
+                f"{regular_close_source}"
+            )
+
+            if history_date is not None:
+
+                print(
+                    f"📚 {ticker} daily history 마지막 날짜: "
+                    f"{history_date}"
+                )
 
             if after_hours_price is not None:
 
@@ -257,7 +477,8 @@ def get_market_price_context(ticker):
                     f"${after_hours_price:.2f}"
                     + (
                         f" ({after_hours_change_pct:+.2f}%)"
-                        if after_hours_change_pct is not None
+                        if after_hours_change_pct
+                        is not None
                         else ""
                     )
                 )
@@ -268,13 +489,69 @@ def get_market_price_context(ticker):
                     f"🌙 {ticker} 시간외 현재가: N/A"
                 )
 
+
+            # ====================================================
+            # 8. STALE DAILY HISTORY DETECTION
+            #
+            # daily history가 하루 이상 늦어도
+            # 정규장 종가 자체는 quote 값으로 계속 사용.
+            # ====================================================
+
+            if (
+                history_date is not None
+                and history_date < us_market_date
+                and market_state in {
+                    "POST",
+                    "POSTPOST"
+                }
+            ):
+
+                print(
+                    "⚠️ DAILY HISTORY 지연 감지"
+                )
+
+                print(
+                    f"   history={history_date}"
+                )
+
+                print(
+                    f"   ET today={us_market_date}"
+                )
+
+                print(
+                    "   → regularMarketPreviousClose 사용"
+                )
+
+
+            # ====================================================
+            # 9. RETURN
+            # ====================================================
+
             return {
-                "regular_close": regular_close,
-                "after_hours_price": after_hours_price,
-                "after_hours_change_pct": after_hours_change_pct,
-                "market_state": market_state,
-                "option_analysis_price": regular_close
+
+                "regular_close":
+                    regular_close,
+
+                "regular_close_source":
+                    regular_close_source,
+
+                "regular_close_date":
+                    history_date,
+
+                "after_hours_price":
+                    after_hours_price,
+
+                "after_hours_change_pct":
+                    after_hours_change_pct,
+
+                "market_state":
+                    market_state,
+
+                "option_analysis_price":
+                    regular_close
+
             }
+
 
         except Exception as e:
 
@@ -282,25 +559,12 @@ def get_market_price_context(ticker):
                 f"⚠️ 가격 조회 실패: {e}"
             )
 
-        if attempt < 3:
-            time.sleep(2)
+            if attempt < 3:
+
+                time.sleep(2)
+
 
     return None
-
-
-def get_current_price(ticker):
-
-    context = get_market_price_context(
-        ticker
-    )
-
-    if context is None:
-        return None
-
-    return context[
-        "option_analysis_price"
-    ]
-
 
 # ============================================================
 # OI SNAPSHOT PATH
