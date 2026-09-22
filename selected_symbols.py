@@ -35,5 +35,6 @@ SELECTED_SYMBOLS = [
     "UBER",
     "MSFT",
     "TSLA",
+    "LHX",
 ]
 
